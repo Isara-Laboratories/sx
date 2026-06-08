@@ -42,7 +42,7 @@ struct Daemon {
 
 fn main() -> Result<()> {
     let mut socket = socket_path();
-    let mut gate: Box<dyn ApprovalGate> = Box::new(CliGate);
+    let mut gate: Box<dyn ApprovalGate> = default_gate();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -51,8 +51,9 @@ fn main() -> Result<()> {
                 socket = PathBuf::from(args.next().context("--socket needs a value")?);
             }
             "--no-gate" => gate = Box::new(AllowAllGate),
+            "--cli-gate" => gate = Box::new(CliGate),
             "-h" | "--help" => {
-                println!("usage: sxd [--socket PATH] [--no-gate]");
+                println!("usage: sxd [--socket PATH] [--cli-gate] [--no-gate]");
                 return Ok(());
             }
             other => anyhow::bail!("unknown argument: {other}"),
@@ -87,6 +88,19 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The gate used unless overridden by a flag: TouchID on macOS (falling back
+/// to a terminal prompt when biometrics/passcode can't be evaluated), and a
+/// terminal prompt elsewhere.
+#[cfg(target_os = "macos")]
+fn default_gate() -> Box<dyn ApprovalGate> {
+    Box::new(gate::TouchIdGate::new(Box::new(CliGate)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_gate() -> Box<dyn ApprovalGate> {
+    Box::new(CliGate)
 }
 
 impl Daemon {

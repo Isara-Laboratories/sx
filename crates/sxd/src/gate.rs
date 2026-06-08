@@ -50,3 +50,43 @@ impl ApprovalGate for AllowAllGate {
         true
     }
 }
+
+/// macOS biometric gate: presents the system TouchID / passcode sheet via
+/// LocalAuthentication. Falls back to `fallback` only when the policy cannot
+/// be evaluated at all (e.g. no device passcode is set) — never on a user
+/// "cancel", which is a deliberate denial.
+#[cfg(target_os = "macos")]
+pub struct TouchIdGate {
+    fallback: Box<dyn ApprovalGate>,
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    /// See `src/touchid.m`. Returns 1 = approved, 0 = denied, -1 = unevaluable.
+    fn sx_touchid_authenticate(reason: *const std::os::raw::c_char) -> std::os::raw::c_int;
+}
+
+#[cfg(target_os = "macos")]
+impl TouchIdGate {
+    pub fn new(fallback: Box<dyn ApprovalGate>) -> Self {
+        Self { fallback }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ApprovalGate for TouchIdGate {
+    fn approve(&self, prompt: &str) -> bool {
+        // The sheet shows a single line, so flatten the multi-line prompt.
+        let reason: String = prompt.split('\n').map(str::trim).collect::<Vec<_>>().join(" — ");
+        let c_reason = match std::ffi::CString::new(reason) {
+            Ok(c) => c,
+            Err(_) => return false, // interior NUL — refuse rather than guess
+        };
+        // Safety: passing a valid NUL-terminated C string; the shim copies it.
+        match unsafe { sx_touchid_authenticate(c_reason.as_ptr()) } {
+            1 => true,
+            0 => false,
+            _ => self.fallback.approve(prompt),
+        }
+    }
+}

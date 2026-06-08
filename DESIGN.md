@@ -149,6 +149,20 @@ socket:
 cwd — the client sends no `cwd` field at all, so it cannot point the daemon at
 an arbitrary `.env` or run a child in a directory it doesn't actually occupy.
 
+## Approval gates (implemented)
+
+The gate is an `ApprovalGate` trait so the two checkpoints (capture and
+per-use) share one implementation:
+
+- **`TouchIdGate` (default on macOS).** Presents the system authentication
+  sheet via LocalAuthentication (`LAPolicyDeviceOwnerAuthentication` — TouchID,
+  Apple Watch, or passcode). A thin Objective-C shim (`src/touchid.m`, built by
+  `build.rs`) blocks on a dispatch semaphore until the user responds. A user
+  *cancel* is a denial; it only falls back to the terminal gate when the policy
+  cannot be evaluated at all (no passcode set).
+- **`CliGate` (`--cli-gate`, default off-macOS).** Yes/no on the daemon's TTY.
+- **`AllowAllGate` (`--no-gate`).** Tests only.
+
 ## Known v1 simplifications (tracked, not hidden)
 
 - **The spawned child is not re-sandboxed.** It currently inherits the daemon's
@@ -157,9 +171,6 @@ an arbitrary `.env` or run a child in a directory it doesn't actually occupy.
 - **No per-session capture scoping yet.** Peer auth restricts callers to the
   owning uid, but any process of that uid can use a live capture. Captures
   should additionally be scoped to the session that created them.
-- **The approval gate is terminal y/N (`CliGate`).** TouchID
-  (`LAContext` / `kSecAccessControl`) is the intended macOS implementation;
-  `AllowAllGate` (`--no-gate`) exists only for tests.
 - **Output is buffered, not streamed.** The child runs to completion before its
   redacted output is returned. Streaming with incremental redaction is a later
   enhancement.
@@ -167,7 +178,7 @@ an arbitrary `.env` or run a child in a directory it doesn't actually occupy.
 ## Roadmap
 
 1. ~~Peer-credential auth + cwd derivation.~~ **Done.**
-2. TouchID-backed gate on macOS.
+2. ~~TouchID-backed gate on macOS.~~ **Done.**
 3. Per-session capture scoping.
 4. Re-sandbox the spawned child.
 5. Keychain backend.

@@ -1,0 +1,12 @@
+# Rust build output
+/target
+
+# Local toolchain / temp dirs from bootstrap
+/.toolchain
+/.tmp
+
+# Secrets and runtime artifacts — never commit
+.env
+.env.*
+!.env.example
+*.sock

@@ -24,7 +24,6 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -189,7 +188,7 @@ impl Daemon {
             Request::Status => Response::Status {
                 captures: self.state.lock().unwrap().info(),
             },
-            Request::Run { secrets, argv } => self.run(secrets, argv, cwd),
+            Request::Run { secrets, argv } => self.grant(secrets, argv),
         }
     }
 
@@ -239,8 +238,14 @@ impl Daemon {
         }
     }
 
-    /// Per-use gate: resolve names from active captures, confirm, spawn child.
-    fn run(&self, secrets: Vec<String>, argv: Vec<String>, cwd: &Path) -> Response {
+    /// Per-use gate: resolve names from active captures and, if the user
+    /// approves *this command*, hand the values back to the client to inject.
+    ///
+    /// The daemon never spawns `argv` — it only displays it at the gate so the
+    /// user knows what the secret will be used for. Execution happens entirely
+    /// in the in-sandbox client, so the daemon is not an executor and cannot be
+    /// turned into a path out of the sandbox.
+    fn grant(&self, secrets: Vec<String>, argv: Vec<String>) -> Response {
         if argv.is_empty() {
             return Response::Error {
                 message: "run requires a command".to_string(),
@@ -266,7 +271,7 @@ impl Daemon {
         }
 
         let prompt = format!(
-            "Agent requests secret(s): {}\nfor command:\n  {}",
+            "Agent requests secret(s): {}\nto run command:\n  {}",
             if secrets.is_empty() {
                 "(none)".to_string()
             } else {
@@ -280,25 +285,7 @@ impl Daemon {
             };
         }
 
-        let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..]).current_dir(cwd);
-        for (k, v) in &injected {
-            cmd.env(k, v);
-        }
-
-        match cmd.output() {
-            Ok(out) => {
-                let values: Vec<String> = injected.into_iter().map(|(_, v)| v).collect();
-                Response::Ran {
-                    code: out.status.code().unwrap_or(-1),
-                    stdout: redact(String::from_utf8_lossy(&out.stdout).into_owned(), &values),
-                    stderr: redact(String::from_utf8_lossy(&out.stderr).into_owned(), &values),
-                }
-            }
-            Err(e) => Response::Error {
-                message: format!("spawning {}: {e}", argv[0]),
-            },
-        }
+        Response::Granted { secrets: injected }
     }
 }
 
@@ -321,15 +308,4 @@ fn parse_env(path: &Path) -> Result<HashMap<String, String>> {
         map.insert(k, v);
     }
     Ok(map)
-}
-
-/// Replace every (non-empty) secret value in `text` with a placeholder.
-fn redact(mut text: String, values: &[String]) -> String {
-    for v in values {
-        if v.is_empty() {
-            continue;
-        }
-        text = text.replace(v.as_str(), "‹redacted›");
-    }
-    text
 }

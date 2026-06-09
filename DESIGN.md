@@ -45,38 +45,70 @@ deployment concern, layered on top — not something this tool can do alone.
   through an approved-but-trojaned command (e.g. an agent-authored `deploy.sh`).
   Mitigated only when combined with network egress control.
 
-## Architecture: a privileged daemon + a powerless client
+## Architecture: a secrets oracle + an in-sandbox executor
 
 ```
-┌─────────────────── agent sandbox ───────────────────┐
-│  agent  ──runs──>  sx  (thin client)                 │
-│                     │  paths / names / argv only     │
-└─────────────────────┼────────────────────────────────┘
-                      │ unix socket
-┌─────────────────────┼──── outside the sandbox ───────┐
-│                     ▼                                 │
-│   sxd (daemon): reads .env, TouchID gate, holds       │
-│   captured secrets in RAM w/ TTL, spawns children     │
-│   with secrets injected, redacts their output         │
-└───────────────────────────────────────────────────────┘
+┌─────────────────── agent sandbox ─────────────────────────┐
+│  agent ──runs──> sx ──execs──> child (gh, curl, …)         │
+│                   │ ▲           (inherits sx's sandbox,    │
+│   names/argv ─────┘ │ values     gets the secret in env)   │
+└─────────────────────┼─────────────────────────────────────┘
+                      │ unix socket (gated release of values)
+┌─────────────────────┼──── outside the sandbox ────────────┐
+│                      ▼                                     │
+│   sxd (daemon): reads .env, TouchID gate, holds captured  │
+│   secrets in RAM w/ TTL. Does NOT execute anything.       │
+└────────────────────────────────────────────────────────────┘
 ```
 
-The split is the whole point. A sandbox restriction is inherited by child
-processes, so an `sx` that the agent runs *inside* the sandbox cannot be granted
-file access the agent lacks. Therefore the component that actually reads secrets
-(`sxd`) must live **outside** the sandbox, and the agent reaches it only across
-the socket. The client (`sx`) never opens a `.env` and never holds a value; it
-forwards paths, secret *names*, and argv, and prints the daemon's redacted
-reply.
+Two design rules drive this split:
+
+1. **The store must be outside the sandbox.** A sandbox restriction is inherited
+   by child processes, so an `sx` the agent runs *inside* the sandbox cannot be
+   granted file access the agent lacks. So the component that reads `.env` /
+   keychain (`sxd`) lives **outside**, reachable only over the socket.
+
+2. **Execution must be inside the sandbox.** If the daemon spawned the command,
+   that child would run in the daemon's *unsandboxed* context — making `sxd` a
+   general "run anything outside the sandbox" oracle, i.e. a privilege-escalation
+   primitive. So the daemon never executes. Instead it returns the values
+   (gated) to `sx`, and `sx` — already inside the sandbox — injects them and
+   execs the command as its own child. The child inherits `sx`'s confinement; it
+   is no more powerful than any command the agent could already run, plus one
+   env var.
+
+The cost of rule 2: plaintext briefly enters one in-sandbox process (`sx`).
+`sx` is therefore the trusted single point that holds a value inside the
+sandbox — see "Trusting `sx`" below.
 
 ### Components
 
 - **`sx-proto`** — newline-delimited JSON wire types (`Request`/`Response`) and
   the agreed socket path (`$SX_SOCKET`, else `$HOME/.sx/sxd.sock`).
-- **`sxd`** — the daemon. Holds captured secrets in memory only; never
-  serializes values back over the wire.
-- **`sx`** — the client. Subcommands: `capture`, `clear`, `status`/`list`,
-  `run`.
+- **`sxd`** — the daemon / secrets oracle. Reads `.env`, gates, holds captured
+  secrets in memory with a TTL. Never executes a command.
+- **`sx`** — the in-sandbox client. For `run`, it receives the gated values and
+  execs the command itself, redacting the values from the child's output.
+  Subcommands: `capture`, `clear`, `status`/`list`, `run`.
+
+## Trusting `sx`
+
+Because `sx` briefly holds plaintext inside the sandbox, it is the single point
+that could leak a value. "It's open source" protects the *user who runs the real
+`sx`*, but does not bind an adversarial agent, which can run a look-alike binary
+that connects to the socket, or scrape the real `sx`'s memory. So the trust has
+to be **enforced**, not assumed (tracked, not yet implemented):
+
+- **Peer attestation.** Before releasing values, the daemon verifies the socket
+  peer *is* the genuine, code-signed `sx`, via the connection's **audit token**
+  (`LOCAL_PEERTOKEN`) and `SecCodeCheckValidity` against a signing requirement.
+  Audit token, not pid (pids are reuse/race-prone).
+- **Hardened runtime, no `get-task-allow`.** Built this way, other same-uid
+  processes cannot attach to `sx` or read its memory.
+
+Until both land, the per-use command binding is only as strong as the agent's
+honesty: a same-uid impostor could request a secret under a benign-looking
+command. The careless-agent and casual-exfil guarantees still hold.
 
 ## The double gate
 
@@ -90,10 +122,9 @@ Two independent human checkpoints, both required:
    *for how long*.
 
 2. **Per-use gate (the inner check).**
-   Each `sx run -s NAME -- cmd …` still prompts the user with the secret
-   name(s) and the full command before the daemon injects the value into the
-   child. A capture being live does **not** grant silent use — every use is
-   confirmed.
+   Each `sx run -s NAME -- cmd …` prompts the user with the secret name(s) and
+   the full command before the daemon *releases* the value to `sx`. A capture
+   being live does **not** grant silent use — every use is confirmed.
 
 This is deliberately stricter than `sudo`'s timestamp model: capture is an
 *added* envelope, not a replacement for per-use confirmation. (The two could be
@@ -106,13 +137,14 @@ or a remembered approval keyed on `(secret, argv)` for noisy dev loops.)
 sx run -s GITHUB_TOKEN -- gh pr create --title "..."
 ```
 
-1. Client sends `{secrets:[GITHUB_TOKEN], argv:[gh, pr, create, …], cwd}`.
+1. `sx` sends `{secrets:[GITHUB_TOKEN], argv:[gh, pr, create, …]}`.
 2. Daemon resolves every name against live captures; unknown name → `Denied`.
 3. Daemon prompts the user with names + full command; refusal → `Denied`.
-4. Daemon spawns the child with the secrets in *its* environment only, in `cwd`.
-5. Daemon captures the child's stdout/stderr, **redacts** every injected value,
-   and returns the redacted streams + exit code. The agent only ever sees the
-   redacted output.
+4. Daemon returns `Granted{secrets}` — the values — to `sx`. It spawns nothing.
+5. `sx` injects the values and execs `gh …` as **its own child**, in `sx`'s cwd,
+   inside the sandbox.
+6. `sx` captures the child's stdout/stderr, **redacts** every injected value, and
+   relays them. The agent only ever sees the redacted output.
 
 ## Backends
 
@@ -165,22 +197,23 @@ per-use) share one implementation:
 
 ## Known v1 simplifications (tracked, not hidden)
 
-- **The spawned child is not re-sandboxed.** It currently inherits the daemon's
-  (unsandboxed) context, which makes `run` an escape hatch. Production must
-  re-apply the agent's sandbox to the child.
+- **`sx` identity is not yet attested.** The plaintext is released to whatever
+  same-uid process connects; until audit-token code-sign attestation lands, an
+  impostor `sx` could obtain it (see "Trusting `sx`").
 - **No per-session capture scoping yet.** Peer auth restricts callers to the
   owning uid, but any process of that uid can use a live capture. Captures
   should additionally be scoped to the session that created them.
 - **Output is buffered, not streamed.** The child runs to completion before its
-  redacted output is returned. Streaming with incremental redaction is a later
+  redacted output is relayed. Streaming with incremental redaction is a later
   enhancement.
 
 ## Roadmap
 
 1. ~~Peer-credential auth + cwd derivation.~~ **Done.**
 2. ~~TouchID-backed gate on macOS.~~ **Done.**
-3. Per-session capture scoping.
-4. Re-sandbox the spawned child.
-5. Keychain backend.
-6. MCP server.
+3. ~~Move execution into the sandboxed client (kill the daemon-as-executor
+   escape hatch).~~ **Done.**
+4. Attest `sx`'s identity: audit-token code-sign check + hardened runtime.
+5. Per-session capture scoping.
+6. Keychain backend.
 7. Streaming output with incremental redaction.

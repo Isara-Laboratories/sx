@@ -51,12 +51,15 @@ pub enum Request {
     /// Report active captures and the secret names they expose (never values).
     Status,
 
-    /// Run `argv` with `secrets` injected into the child process only.
+    /// Request the named secrets in order to run `argv`.
     ///
-    /// Requires (a) an active capture providing every requested name, and
-    /// (b) a per-use approval — the inner gate. The child runs in the caller's
-    /// verified cwd (derived daemon-side); its output is redacted of the
-    /// injected values before being returned.
+    /// The daemon does NOT execute anything — it resolves the names against
+    /// active captures, gates on the shown command, and (if approved) returns
+    /// the values to the caller via [`Response::Granted`]. The client (`sx`),
+    /// which lives inside the sandbox, then injects them and execs `argv`
+    /// itself, so the child inherits the client's confinement and the daemon
+    /// is never an executor. `argv` is sent so the daemon can show it at the
+    /// gate; the daemon does not run it.
     Run {
         secrets: Vec<String>,
         argv: Vec<String>,
@@ -80,12 +83,11 @@ pub enum Response {
     /// Current daemon state.
     Status { captures: Vec<CaptureInfo> },
 
-    /// A command finished. Output is already redacted.
-    Ran {
-        code: i32,
-        stdout: String,
-        stderr: String,
-    },
+    /// The per-use gate approved: here are the requested secret values for the
+    /// client to inject into the child it is about to exec. This is the only
+    /// message that carries plaintext, and only to an (eventually attested)
+    /// in-sandbox `sx`. `secrets` preserves request order as (name, value).
+    Granted { secrets: Vec<(String, String)> },
 
     /// A gate (capture or per-use) refused, or a precondition failed.
     Denied { reason: String },

@@ -7,11 +7,13 @@ its LLM context), and a `.env` the agent can read can't be sandboxed away. `sx`
 lets programs the agent runs *use* secrets without letting the agent *read*
 them, with a human in the loop at capture and at each use.
 
-- **`sx`** — a powerless in-sandbox client. Forwards paths, secret names, and
-  argv; never reads a secret.
-- **`sxd`** — a daemon outside the sandbox. Reads `.env` files (TouchID-gated),
-  holds values in memory under a TTL, injects them into child processes it
-  spawns, and redacts them out of the output.
+- **`sxd`** — a secrets oracle outside the sandbox. Reads `.env` files
+  (TouchID-gated), holds values in memory under a TTL, and releases them on
+  approval. It never executes anything.
+- **`sx`** — the in-sandbox client. For `run`, it receives the gated values,
+  injects them, and execs the command as **its own** child — so the child
+  inherits `sx`'s sandbox and the daemon is never a way out of it. Redacts the
+  values from the command's output.
 
 ```sh
 sxd                                   # run the daemon (outside the sandbox)

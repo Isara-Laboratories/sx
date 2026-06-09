@@ -1,0 +1,15 @@
+[package]
+name = "sx"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sx"
+path = "src/main.rs"
+
+[dependencies]
+sx-proto = { path = "../sx-proto" }
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true

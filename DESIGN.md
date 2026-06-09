@@ -203,9 +203,11 @@ per-use) share one implementation:
 - **No per-session capture scoping yet.** Peer auth restricts callers to the
   owning uid, but any process of that uid can use a live capture. Captures
   should additionally be scoped to the session that created them.
-- **Output is buffered, not streamed.** The child runs to completion before its
-  redacted output is relayed. Streaming with incremental redaction is a later
-  enhancement.
+- **Fully-interactive commands aren't supported.** `sx run` inherits stdin (so
+  piped/redirected input works), but buffers stdout/stderr until the child exits
+  so the values can be redacted. A command that must display output *before*
+  reading input (a live TUI/pager, an interactive password prompt) won't show it
+  until exit. Streaming with incremental redaction is a later enhancement.
 
 ## Roadmap
 

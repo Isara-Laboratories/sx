@@ -115,8 +115,12 @@ impl Daemon {
         Ok(())
     }
 
-    /// Verify the caller, derive its cwd, then read and dispatch the request.
+    /// Verify the caller, then read and dispatch the request.
     /// Every failure path returns a `Response` so the client always hears back.
+    ///
+    /// The caller's cwd is derived lazily by the handlers that need it (only
+    /// `capture`, and `clear` when given a path), not here — a transient
+    /// `proc_pidinfo` failure must not break `status`/`clear`/`run`.
     fn authenticate_and_dispatch(&self, stream: &UnixStream) -> Response {
         let peer = match Peer::from_stream(stream) {
             Ok(p) => p,
@@ -133,15 +137,6 @@ impl Daemon {
                 reason: format!("connection from uid {} refused", peer.uid),
             };
         }
-
-        let cwd = match peer.cwd() {
-            Ok(c) => c,
-            Err(e) => {
-                return Response::Error {
-                    message: format!("cannot determine caller cwd (pid {}): {e}", peer.pid),
-                }
-            }
-        };
 
         let mut reader = BufReader::new(match stream.try_clone() {
             Ok(s) => s,
@@ -167,28 +162,51 @@ impl Daemon {
         }
 
         match serde_json::from_str::<Request>(line.trim()) {
-            Ok(req) => self.dispatch(req, &cwd),
+            Ok(req) => self.dispatch(req, &peer),
             Err(e) => Response::Error {
                 message: format!("malformed request: {e}"),
             },
         }
     }
 
-    fn dispatch(&self, req: Request, cwd: &Path) -> Response {
+    fn dispatch(&self, req: Request, peer: &Peer) -> Response {
         match req {
             Request::Capture { path, ttl_secs } => {
-                self.capture(path, cwd, ttl_secs.unwrap_or(DEFAULT_TTL_SECS))
+                let cwd = match peer.cwd() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Response::Error {
+                            message: format!(
+                                "cannot determine caller cwd (pid {}): {e}",
+                                peer.pid
+                            ),
+                        }
+                    }
+                };
+                self.capture(path, &cwd, ttl_secs.unwrap_or(DEFAULT_TTL_SECS))
             }
-            Request::Clear { path } => {
-                let n = self.state.lock().unwrap().clear(path.as_deref());
-                Response::Ok {
-                    message: format!("cleared {n} capture(s)"),
-                }
-            }
+            Request::Clear { path } => self.clear(path, peer),
             Request::Status => Response::Status {
                 captures: self.state.lock().unwrap().info(),
             },
             Request::Run { secrets, argv } => self.grant(secrets, argv),
+        }
+    }
+
+    /// Drop captures. A `path` is resolved the same way `capture` resolves it
+    /// (relative to the caller's verified cwd, then canonicalized) so that the
+    /// argument matches the canonical key the capture is stored under — without
+    /// this, `sx clear .env` would never match and the secret would not revoke.
+    fn clear(&self, path: Option<String>, peer: &Peer) -> Response {
+        let target = path.map(|p| match peer.cwd() {
+            Ok(cwd) => resolve(&cwd, &p)
+                .map(|r| r.display().to_string())
+                .unwrap_or(p),
+            Err(_) => p,
+        });
+        let n = self.state.lock().unwrap().clear(target.as_deref());
+        Response::Ok {
+            message: format!("cleared {n} capture(s)"),
         }
     }
 
@@ -252,19 +270,8 @@ impl Daemon {
             };
         }
 
-        // Resolve every requested name against active captures.
-        let mut injected: Vec<(String, String)> = Vec::new();
-        let mut missing: Vec<String> = Vec::new();
-        {
-            let mut st = self.state.lock().unwrap();
-            for name in &secrets {
-                match st.lookup(name) {
-                    Some(v) => injected.push((name.clone(), v)),
-                    None => missing.push(name.clone()),
-                }
-            }
-        }
-        if !missing.is_empty() {
+        // Pre-check availability so we only prompt for a command we can serve.
+        if let Some(missing) = self.missing_secrets(&secrets) {
             return Response::Denied {
                 reason: format!("no active capture provides: {}", missing.join(", ")),
             };
@@ -285,7 +292,38 @@ impl Daemon {
             };
         }
 
+        // Re-resolve *after* approval: the gate can block for minutes, and a
+        // capture's TTL may have lapsed while the user was deciding. The values
+        // released must reflect state at approval time, not before the prompt.
+        let mut injected: Vec<(String, String)> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
+        {
+            let mut st = self.state.lock().unwrap();
+            for name in &secrets {
+                match st.lookup(name) {
+                    Some(v) => injected.push((name.clone(), v)),
+                    None => missing.push(name.clone()),
+                }
+            }
+        }
+        if !missing.is_empty() {
+            return Response::Denied {
+                reason: format!("capture expired during approval: {}", missing.join(", ")),
+            };
+        }
+
         Response::Granted { secrets: injected }
+    }
+
+    /// Names not currently provided by any live capture, or `None` if all present.
+    fn missing_secrets(&self, names: &[String]) -> Option<Vec<String>> {
+        let mut st = self.state.lock().unwrap();
+        let missing: Vec<String> = names
+            .iter()
+            .filter(|n| st.lookup(n).is_none())
+            .cloned()
+            .collect();
+        (!missing.is_empty()).then_some(missing)
     }
 }
 

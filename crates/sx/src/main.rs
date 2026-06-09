@@ -11,7 +11,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -110,10 +110,19 @@ fn exec_with_secrets(secrets: Vec<String>, argv: Vec<String>) -> Result<ExitCode
     for (name, value) in &granted {
         cmd.env(name, value);
     }
+    // Inherit stdin so commands that read input (pipes, prompts) work; capture
+    // stdout/stderr so we can redact the secret values out of them before they
+    // reach our own stdout (which the agent sees). `wait_with_output` drains
+    // both pipes concurrently, avoiding the classic pipe-buffer deadlock.
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let output = cmd
-        .output()
-        .with_context(|| format!("running {}", argv[0]))?;
+        .spawn()
+        .with_context(|| format!("running {}", argv[0]))?
+        .wait_with_output()
+        .with_context(|| format!("waiting for {}", argv[0]))?;
 
     // Redact the injected values from whatever the command emitted before it
     // reaches our stdout/stderr (which the agent sees).

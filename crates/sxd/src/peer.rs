@@ -117,8 +117,9 @@ fn pid_cwd(pid: i32) -> io::Result<PathBuf> {
     // vip_path is a NUL-terminated path in a fixed 1024-byte buffer
     // (declared as [[c_char; 32]; 32] in libc to satisfy old rustc).
     let raw = &info.pvi_cdir.vip_path;
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u8, std::mem::size_of_val(raw)) };
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(raw.as_ptr() as *const u8, std::mem::size_of_val(raw))
+    };
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     Ok(PathBuf::from(OsStr::from_bytes(&bytes[..end])))
 }

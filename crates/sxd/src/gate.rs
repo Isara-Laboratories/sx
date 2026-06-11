@@ -77,7 +77,11 @@ impl TouchIdGate {
 impl ApprovalGate for TouchIdGate {
     fn approve(&self, prompt: &str) -> bool {
         // The sheet shows a single line, so flatten the multi-line prompt.
-        let reason: String = prompt.split('\n').map(str::trim).collect::<Vec<_>>().join(" — ");
+        let reason: String = prompt
+            .split('\n')
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" — ");
         let c_reason = match std::ffi::CString::new(reason) {
             Ok(c) => c,
             Err(_) => return false, // interior NUL — refuse rather than guess

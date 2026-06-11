@@ -84,8 +84,11 @@ impl State {
     pub fn live(&mut self, source: &str) -> Option<LiveGrant> {
         self.purge_expired();
         self.grants.iter().find(|c| c.source == source).map(|c| {
-            let mut values: Vec<(String, String)> =
-                c.values.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let mut values: Vec<(String, String)> = c
+                .values
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
             values.sort_by(|a, b| a.0.cmp(&b.0));
             LiveGrant {
                 allow_all: c.allow_all,

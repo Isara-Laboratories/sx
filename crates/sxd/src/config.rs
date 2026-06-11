@@ -170,11 +170,8 @@ mod tests {
         fn new() -> Self {
             static N: AtomicU32 = AtomicU32::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "sxd-cfg-test-{}-{}",
-                std::process::id(),
-                n
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("sxd-cfg-test-{}-{}", std::process::id(), n));
             std::fs::create_dir_all(&dir).unwrap();
             TempDir(dir)
         }
@@ -213,7 +210,10 @@ mod tests {
         let cfg = dir.path().join("config");
         std::fs::write(&cfg, "other_key=keep-me\naws_cli_path=/old/aws\n").unwrap();
         write_value(&cfg, AWS_CLI_PATH, "/new/aws").unwrap();
-        assert_eq!(read_value(&cfg, "other_key").unwrap().as_deref(), Some("keep-me"));
+        assert_eq!(
+            read_value(&cfg, "other_key").unwrap().as_deref(),
+            Some("keep-me")
+        );
         assert_eq!(
             read_value(&cfg, AWS_CLI_PATH).unwrap().as_deref(),
             Some("/new/aws")

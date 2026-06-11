@@ -67,7 +67,9 @@ sx run --env .env --aws-profile prod -- ./deploy.sh
   calls and wants to skip the prompts, they (not you) can run
   `sx grant-all --env <file>` or `sx grant-all --aws-profile <profile>` once to
   allow that source for an hour — suggest it, but don't assume it, since it
-  lowers their security.
+  lowers their security. `grant-all` also takes `--lease <duration>` to set the
+  window (e.g. `30m`, `2h`, `1d`; default 1h, max 24h), e.g.
+  `sx grant-all --env .env --lease 1d`.
 
 ## Quick reference
 

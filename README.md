@@ -59,6 +59,9 @@ sx run --env .env -- gh pr merge      # within the hour: still confirms THIS com
 sx grant-all --env .env               # one prompt, then its commands run unprompted
 sx run --env .env -- gh pr merge      # no prompt
 
+# Pick a longer (or shorter) window with --lease (default 1h, max 24h):
+sx grant-all --env .env --lease 1d    # allow-all for a day; also accepts 30m, 2h, 5400
+
 sx status                             # granted files + mode + names (never values)
 sx clear .env                         # revoke early
 

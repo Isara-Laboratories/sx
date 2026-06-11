@@ -31,7 +31,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use sx_proto::{socket_path, Request, Response, GRANT_TTL_SECS};
+use sx_proto::{humanize_secs, socket_path, Request, Response, GRANT_TTL_MAX_SECS, GRANT_TTL_SECS};
 
 use gate::{AllowAllGate, ApprovalGate, CliGate};
 use peer::Peer;
@@ -273,7 +273,11 @@ impl Daemon {
             Request::Status => Response::Status {
                 captures: self.state.lock().unwrap().info(),
             },
-            Request::GrantAll { env, aws_profiles } => self.grant_all(env, aws_profiles, peer),
+            Request::GrantAll {
+                env,
+                aws_profiles,
+                lease_secs,
+            } => self.grant_all(env, aws_profiles, lease_secs, peer),
             Request::Run {
                 env,
                 aws_profiles,
@@ -309,25 +313,49 @@ impl Daemon {
 
     /// Pre-authorize sources in allow-all mode (no command). Prompts once per
     /// source to grant it for the window with the per-command prompt suppressed.
-    fn grant_all(&self, env: Vec<String>, aws_profiles: Vec<String>, peer: &Peer) -> Response {
+    fn grant_all(
+        &self,
+        env: Vec<String>,
+        aws_profiles: Vec<String>,
+        lease_secs: Option<u64>,
+        peer: &Peer,
+    ) -> Response {
         if env.is_empty() && aws_profiles.is_empty() {
             return Response::Error {
                 message: "grant-all requires at least one --env <path> or --aws-profile <profile>"
                     .to_string(),
             };
         }
+
+        // Validate the requested lease against the hard maximum; reject rather
+        // than silently clamp. `None` falls back to the default 1h.
+        let ttl_secs = lease_secs.unwrap_or(GRANT_TTL_SECS);
+        if ttl_secs > GRANT_TTL_MAX_SECS {
+            return Response::Denied {
+                reason: format!(
+                    "lease {} exceeds maximum of {}",
+                    humanize_secs(ttl_secs),
+                    humanize_secs(GRANT_TTL_MAX_SECS)
+                ),
+            };
+        }
+        let ttl = Duration::from_secs(ttl_secs);
+
         let sources = match build_sources(&env, &aws_profiles, peer) {
             Ok(s) => s,
             Err(resp) => return resp,
         };
         let count = sources.len();
         for src in &sources {
-            if let Err(resp) = self.authorize(src, None, true) {
+            if let Err(resp) = self.authorize(src, None, true, ttl) {
                 return resp;
             }
         }
         Response::Ok {
-            message: format!("allow-all granted for {count} source(s) (1h)"),
+            message: format!(
+                "allow-all granted for {count} source(s) ({})",
+                humanize_secs(ttl_secs)
+            ),
         }
     }
 
@@ -359,10 +387,12 @@ impl Daemon {
         };
 
         // Merge the values of every requested source, in order (later sources
-        // win), running both gates per source along the way.
+        // win), running both gates per source along the way. `run` always uses
+        // the fixed default lease; only `grant_all --lease` varies it.
+        let ttl = Duration::from_secs(GRANT_TTL_SECS);
         let mut merged: Vec<(String, String)> = Vec::new();
         for src in &sources {
-            let values = match self.authorize(src, Some(&argv), grant_all) {
+            let values = match self.authorize(src, Some(&argv), grant_all, ttl) {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
@@ -386,18 +416,23 @@ impl Daemon {
     ///
     /// `argv == None` means "pre-authorize only" (no command to confirm).
     /// `Err(Response)` carries a denial/error to return verbatim.
+    ///
+    /// `ttl` is the lease applied to any grant established or upgraded here.
+    /// `run` callers always pass [`GRANT_TTL_SECS`]; only `grant_all` varies it
+    /// (via `--lease`).
     fn authorize(
         &self,
         src: &Source,
         argv: Option<&[String]>,
         make_allow_all: bool,
+        ttl: Duration,
     ) -> Result<Vec<(String, String)>, Response> {
         let source = src.key();
         let live = self.state.lock().unwrap().live(source);
 
         // First use of this source → file-grant gate (reads/mints fresh).
         let Some(live) = live else {
-            return self.establish_grant(src, argv, make_allow_all);
+            return self.establish_grant(src, argv, make_allow_all, ttl);
         };
 
         // Already allow-all, and not asked to change → no prompt.
@@ -407,15 +442,12 @@ impl Daemon {
 
         // Asked to upgrade a confirm-mode grant to allow-all.
         if make_allow_all {
-            if !self.gate.approve(&allow_all_prompt(src)) {
+            if !self.gate.approve(&allow_all_prompt(src, ttl)) {
                 return Err(Response::Denied {
                     reason: format!("allow-all not approved for {source}"),
                 });
             }
-            self.state
-                .lock()
-                .unwrap()
-                .set_allow_all(source, Duration::from_secs(GRANT_TTL_SECS));
+            self.state.lock().unwrap().set_allow_all(source, ttl);
             return Ok(live.values);
         }
 
@@ -441,11 +473,12 @@ impl Daemon {
         src: &Source,
         argv: Option<&[String]>,
         allow_all: bool,
+        ttl: Duration,
     ) -> Result<Vec<(String, String)>, Response> {
         let prompt = if allow_all {
-            allow_all_prompt(src)
+            allow_all_prompt(src, ttl)
         } else {
-            first_run_prompt(src, argv)
+            first_run_prompt(src, argv, ttl)
         };
         if !self.gate.approve(&prompt) {
             return Err(Response::Denied {
@@ -457,12 +490,10 @@ impl Daemon {
         // Response verbatim so any CLI stderr never enters a successful grant.
         let values = src.values()?;
 
-        self.state.lock().unwrap().add(
-            src.key().to_string(),
-            values.clone(),
-            Duration::from_secs(GRANT_TTL_SECS),
-            allow_all,
-        );
+        self.state
+            .lock()
+            .unwrap()
+            .add(src.key().to_string(), values.clone(), ttl, allow_all);
 
         let mut out: Vec<(String, String)> = values.into_iter().collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -522,11 +553,11 @@ impl Source {
     }
 }
 
-fn first_run_prompt(src: &Source, argv: Option<&[String]>) -> String {
+fn first_run_prompt(src: &Source, argv: Option<&[String]>, ttl: Duration) -> String {
     let mut p = format!(
-        "Grant access to {}\nfor {} minutes.",
+        "Grant access to {}\nfor {}.",
         src.subject(),
-        GRANT_TTL_SECS / 60
+        humanize_secs(ttl.as_secs())
     );
     if let Some(argv) = argv {
         p.push_str(&format!("\nThis command will run:\n  {}", argv.join(" ")));
@@ -542,11 +573,11 @@ fn per_command_prompt(src: &Source, argv: &[String]) -> String {
     )
 }
 
-fn allow_all_prompt(src: &Source) -> String {
+fn allow_all_prompt(src: &Source, ttl: Duration) -> String {
     format!(
-        "Allow ALL commands to use {}\nfor {} minutes, without confirming each one.",
+        "Allow ALL commands to use {}\nfor {}, without confirming each one.",
         src.subject(),
-        GRANT_TTL_SECS / 60
+        humanize_secs(ttl.as_secs())
     )
 }
 
@@ -717,7 +748,9 @@ fn mint_aws(profile: &str) -> Result<HashMap<String, String>, Response> {
         });
     }
 
-    Ok(parse_env_no_export(&String::from_utf8_lossy(&output.stdout)))
+    Ok(parse_env_no_export(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 /// Parse the `KEY=VALUE` lines printed by
@@ -773,10 +806,11 @@ mod tests {
             profile: "prod".to_string(),
         };
         assert_eq!(src.key(), "aws:prod");
-        let first = first_run_prompt(&src, Some(&["cmd".to_string()]));
+        let ttl = Duration::from_secs(GRANT_TTL_SECS);
+        let first = first_run_prompt(&src, Some(&["cmd".to_string()]), ttl);
         assert!(first.contains("AWS credentials for profile:\n  prod"));
         assert!(first.contains("This command will run:\n  cmd"));
-        assert!(allow_all_prompt(&src).contains("AWS credentials for profile:\n  prod"));
+        assert!(allow_all_prompt(&src, ttl).contains("AWS credentials for profile:\n  prod"));
         assert!(per_command_prompt(&src, &["cmd".to_string()])
             .contains("with AWS credentials for profile:\n  prod"));
     }
@@ -788,8 +822,98 @@ mod tests {
             path: PathBuf::from("/tmp/.env"),
         };
         assert_eq!(src.key(), "/tmp/.env");
-        assert!(first_run_prompt(&src, None).contains("secrets in:\n  /tmp/.env"));
+        let ttl = Duration::from_secs(GRANT_TTL_SECS);
+        assert!(first_run_prompt(&src, None, ttl).contains("secrets in:\n  /tmp/.env"));
         assert!(per_command_prompt(&src, &["x".to_string()])
             .contains("with secrets from:\n  /tmp/.env"));
+    }
+
+    fn allow_all_daemon() -> Daemon {
+        Daemon {
+            state: Mutex::new(State::default()),
+            gate: Box::new(AllowAllGate),
+        }
+    }
+
+    /// A peer whose pid is this test process, so `cwd()` resolves successfully.
+    /// (`grant_all` itself performs no uid check.)
+    fn self_peer() -> Peer {
+        Peer {
+            uid: 0,
+            pid: std::process::id() as i32,
+        }
+    }
+
+    #[test]
+    fn grant_all_with_custom_lease_uses_it() {
+        let dir = std::env::temp_dir().join(format!("sx-lease-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join(".env");
+        std::fs::write(&env_path, "FOO=bar\n").unwrap();
+
+        let daemon = allow_all_daemon();
+        let resp = daemon.grant_all(
+            vec![env_path.to_string_lossy().into_owned()],
+            vec![],
+            Some(1800),
+            &self_peer(),
+        );
+        match resp {
+            Response::Ok { message } => assert!(
+                message.contains("30 minutes"),
+                "message should reflect the lease: {message}"
+            ),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        // The stored grant is allow-all and carries (about) the chosen TTL.
+        let info = daemon.state.lock().unwrap().info();
+        assert_eq!(info.len(), 1);
+        assert!(info[0].allow_all);
+        assert!(
+            info[0].expires_in_secs > 1700 && info[0].expires_in_secs <= 1800,
+            "unexpected ttl: {}",
+            info[0].expires_in_secs
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn grant_all_rejects_lease_over_max() {
+        let daemon = allow_all_daemon();
+        // The lease check fires before any source resolution or minting, so an
+        // AWS source (never reached) is fine and needs no AWS CLI.
+        let resp = daemon.grant_all(
+            vec![],
+            vec!["prod".to_string()],
+            Some(GRANT_TTL_MAX_SECS + 1),
+            &self_peer(),
+        );
+        match resp {
+            Response::Denied { reason } => assert!(
+                reason.contains("exceeds maximum"),
+                "unexpected reason: {reason}"
+            ),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        // Nothing was granted.
+        assert!(daemon.state.lock().unwrap().info().is_empty());
+    }
+
+    #[test]
+    fn prompts_reflect_the_chosen_lease() {
+        let src = Source::Env {
+            key: "/tmp/.env".to_string(),
+            path: PathBuf::from("/tmp/.env"),
+        };
+        // Default 1h reads as "1 hour".
+        assert!(
+            first_run_prompt(&src, None, Duration::from_secs(GRANT_TTL_SECS))
+                .contains("for 1 hour.")
+        );
+        // A custom lease is rendered human-readably in both prompts.
+        assert!(allow_all_prompt(&src, Duration::from_secs(86_400)).contains("for 1 day,"));
+        assert!(allow_all_prompt(&src, Duration::from_secs(1800)).contains("for 30 minutes,"));
     }
 }

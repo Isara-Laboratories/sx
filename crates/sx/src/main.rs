@@ -17,7 +17,7 @@ use std::process::{Command, ExitCode, Stdio};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use sx_proto::{socket_path, Request, Response};
+use sx_proto::{parse_duration, socket_path, Request, Response};
 
 #[derive(Parser)]
 #[command(
@@ -52,10 +52,15 @@ enum Cmd {
         #[command(subcommand)]
         action: SkillAction,
     },
-    /// Grant a .env file for 1h AND allow all its commands without per-command
+    /// Grant a .env file AND allow all its commands without per-command
     /// prompts. Runs nothing — use this to opt a file out of confirmation.
     ///
-    /// Example: sx grant-all --env .env
+    /// The grant lasts one hour by default; pass --lease <DURATION> to choose a
+    /// different window, up to a maximum of 24 hours (1d). A duration is an
+    /// integer with an optional unit suffix s/m/h/d (no suffix = seconds), e.g.
+    /// 30m, 2h, 1d, or 5400.
+    ///
+    /// Example: sx grant-all --env .env --lease 1d
     GrantAll {
         /// Path to a .env file to allow-all (repeatable).
         #[arg(long = "env")]
@@ -63,6 +68,10 @@ enum Cmd {
         /// AWS profile to allow-all (repeatable).
         #[arg(long = "aws-profile")]
         aws_profile: Vec<String>,
+        /// How long the grant lasts: 30m, 2h, 1d, or plain seconds (default 1h,
+        /// max 24h).
+        #[arg(long = "lease", value_parser = parse_duration)]
+        lease: Option<u64>,
     },
     /// Run a command with the secrets from one or more sources injected.
     ///
@@ -149,7 +158,11 @@ fn run() -> Result<ExitCode> {
             }
             exec_with_secrets(env, aws_profile, argv, grant_all)
         }
-        Cmd::GrantAll { env, aws_profile } => {
+        Cmd::GrantAll {
+            env,
+            aws_profile,
+            lease,
+        } => {
             if env.is_empty() && aws_profile.is_empty() {
                 anyhow::bail!(
                     "grant-all requires at least one --env <path> or --aws-profile <profile>"
@@ -158,6 +171,7 @@ fn run() -> Result<ExitCode> {
             Ok(render(send(&Request::GrantAll {
                 env,
                 aws_profiles: aws_profile,
+                lease_secs: lease,
             })?))
         }
         Cmd::Clear { path, aws_profile } => {
@@ -230,8 +244,14 @@ fn exec_with_secrets(
     // Redact the injected values from whatever the command emitted before it
     // reaches our stdout/stderr (which the agent sees).
     let values: Vec<&str> = granted.iter().map(|(_, v)| v.as_str()).collect();
-    print!("{}", redact(String::from_utf8_lossy(&output.stdout), &values));
-    eprint!("{}", redact(String::from_utf8_lossy(&output.stderr), &values));
+    print!(
+        "{}",
+        redact(String::from_utf8_lossy(&output.stdout), &values)
+    );
+    eprint!(
+        "{}",
+        redact(String::from_utf8_lossy(&output.stderr), &values)
+    );
 
     Ok(ExitCode::from(
         u8::try_from(output.status.code().unwrap_or(1)).unwrap_or(1),

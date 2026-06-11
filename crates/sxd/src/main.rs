@@ -387,15 +387,12 @@ impl Daemon {
         };
 
         // Merge the values of every requested source, in order (later sources
-        // win), running both gates per source along the way.
+        // win), running both gates per source along the way. `run` always uses
+        // the fixed default lease; only `grant_all --lease` varies it.
+        let ttl = Duration::from_secs(GRANT_TTL_SECS);
         let mut merged: Vec<(String, String)> = Vec::new();
         for src in &sources {
-            let values = match self.authorize(
-                src,
-                Some(&argv),
-                grant_all,
-                Duration::from_secs(GRANT_TTL_SECS),
-            ) {
+            let values = match self.authorize(src, Some(&argv), grant_all, ttl) {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };

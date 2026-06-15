@@ -95,9 +95,10 @@ sandbox — see "Trusting `sx`" below.
   (resolve the `aws` CLI path into `~/.sx/config`), `uninstall`.
 - **`sx`** — the in-sandbox client. For `run`, it receives the granted values and
   execs the command itself, redacting the values from the child's output.
-  Subcommands: `run` (`--env <path>`, `--aws-profile <name>`, `--grant-all`),
-  `grant-all`, `clear` (`--aws-profile <name>` or a path), `status`/`list`.
-  `run`/`grant-all` require at least one `--env` or `--aws-profile`.
+  Subcommands: `run` (`--env <path>`, `--aws-profile <name>`, `--grant-all`,
+  `--renew`), `grant-all` (`--lease <duration>`, `--renew`), `clear`
+  (`--aws-profile <name>` or a path), `status`/`list`. `run`/`grant-all` require
+  at least one `--env` or `--aws-profile`; `run --renew` requires `--grant-all`.
 
 ## Trusting `sx`
 
@@ -148,6 +149,15 @@ source batch. While allow-all, any command against that source is unprompted, so
 redaction and (eventually) egress restriction are the only backstops; reserve it
 for low-sensitivity sources. `sx status` shows each grant's mode (`[confirm
 each command]` vs `[allow-all]`).
+
+Re-issuing `grant-all` against a source whose allow-all window is still live is a
+**silent no-op**: it reuses the existing window rather than re-prompting, so an
+agent (or user) repeating `grant-all` does not generate a fresh TouchID prompt
+each time (in a multi-source batch, the whole batch is skipped when every source
+is already live). To deliberately start a new window before the old one expires —
+re-prompting, re-reading/minting the values, and resetting the lease — pass
+`sx grant-all --renew` (or `sx run --grant-all --renew`). Upgrading a source from
+confirm-mode to allow-all still prompts, since that is a genuine escalation.
 
 ## How a secret is used
 

@@ -60,6 +60,10 @@ enum Cmd {
     /// integer with an optional unit suffix s/m/h/d (no suffix = seconds), e.g.
     /// 30m, 2h, 1d, or 5400.
     ///
+    /// Re-running this while the window is still live just reuses it (no second
+    /// prompt). Pass --renew to start a fresh window early (re-prompt, reset the
+    /// lease).
+    ///
     /// Example: sx grant-all --env .env --lease 1d
     GrantAll {
         /// Path to a .env file to allow-all (repeatable).
@@ -72,6 +76,10 @@ enum Cmd {
         /// max 24h).
         #[arg(long = "lease", value_parser = parse_duration)]
         lease: Option<u64>,
+        /// Start a fresh allow-all window even if one is still live: re-prompt,
+        /// re-read/mint the values, and reset the lease.
+        #[arg(long)]
+        renew: bool,
     },
     /// Run a command with the secrets from one or more sources injected.
     ///
@@ -79,7 +87,9 @@ enum Cmd {
     /// at least one of either is required. The first use of a given source
     /// prompts for a 1-hour grant; by default every command is then confirmed
     /// individually. Pass --grant-all to opt the source(s) out of per-command
-    /// confirmation for the window. The source(s) must be given each call.
+    /// confirmation for the window; re-running with --grant-all while that
+    /// window is live just reuses it (no second prompt) unless --renew is given.
+    /// The source(s) must be given each call.
     ///
     /// Example: sx run --env .env --aws-profile prod -- gh pr create
     Run {
@@ -92,6 +102,10 @@ enum Cmd {
         /// Skip per-command confirmation for these source(s) for the grant window.
         #[arg(long = "grant-all")]
         grant_all: bool,
+        /// With --grant-all, start a fresh allow-all window even if one is live:
+        /// re-prompt, re-read/mint the values, and reset the lease.
+        #[arg(long, requires = "grant_all")]
+        renew: bool,
         /// The command and its arguments, after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
@@ -151,17 +165,19 @@ fn run() -> Result<ExitCode> {
             env,
             aws_profile,
             grant_all,
+            renew,
             argv,
         } => {
             if env.is_empty() && aws_profile.is_empty() {
                 anyhow::bail!("run requires at least one --env <path> or --aws-profile <profile>");
             }
-            exec_with_secrets(env, aws_profile, argv, grant_all)
+            exec_with_secrets(env, aws_profile, argv, grant_all, renew)
         }
         Cmd::GrantAll {
             env,
             aws_profile,
             lease,
+            renew,
         } => {
             if env.is_empty() && aws_profile.is_empty() {
                 anyhow::bail!(
@@ -172,6 +188,7 @@ fn run() -> Result<ExitCode> {
                 env,
                 aws_profiles: aws_profile,
                 lease_secs: lease,
+                renew,
             })?))
         }
         Cmd::Clear { path, aws_profile } => {
@@ -209,12 +226,14 @@ fn exec_with_secrets(
     aws_profiles: Vec<String>,
     argv: Vec<String>,
     grant_all: bool,
+    renew: bool,
 ) -> Result<ExitCode> {
     let response = send(&Request::Run {
         env,
         aws_profiles,
         argv: argv.clone(),
         grant_all,
+        renew,
     })?;
 
     let granted = match response {

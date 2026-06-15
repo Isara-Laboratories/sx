@@ -138,14 +138,16 @@ while AWS profiles are keyed under a synthetic `aws:<profile>` identity.
    command's confirmation.) Re-validated after approval, so a grant that expires
    at the prompt is denied.
 
-**Opting a file out — `grant-all`.** `sx grant-all --env <path>` (or
-`sx run --grant-all --env <path> -- cmd`) marks a file *allow-all* for its 1h
-window: one prompt up front, then no per-command confirmation. This is the
-`sudo`-timestamp / `aws-vault` ergonomic escape hatch, **off by default** — you
-ask for it per file. While allow-all, any command against that file is
-unprompted, so redaction and (eventually) egress restriction are the only
-backstops; reserve it for low-sensitivity files. `sx status` shows each grant's
-mode (`[confirm each command]` vs `[allow-all]`).
+**Opting sources out — `grant-all`.** `sx grant-all --env <path>` (or
+`sx run --grant-all --env <path> -- cmd`) marks a source *allow-all* for its 1h
+window: one prompt up front, then no per-command confirmation. Standalone
+`grant-all` accepts multiple repeatable sources, so one prompt can cover several
+files/profiles for the same lease. This is the `sudo`-timestamp / `aws-vault`
+ergonomic escape hatch, **off by default** — you ask for it per source or
+source batch. While allow-all, any command against that source is unprompted, so
+redaction and (eventually) egress restriction are the only backstops; reserve it
+for low-sensitivity sources. `sx status` shows each grant's mode (`[confirm
+each command]` vs `[allow-all]`).
 
 ## How a secret is used
 

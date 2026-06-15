@@ -346,11 +346,19 @@ impl Daemon {
             Err(resp) => return resp,
         };
         let count = sources.len();
-        for src in &sources {
-            if let Err(resp) = self.authorize(src, None, true, ttl) {
+
+        if count > 1 {
+            if let Err(resp) = self.authorize_allow_all_batch(&sources, ttl) {
                 return resp;
             }
+        } else {
+            for src in &sources {
+                if let Err(resp) = self.authorize(src, None, true, ttl) {
+                    return resp;
+                }
+            }
         }
+
         Response::Ok {
             message: format!(
                 "allow-all granted for {count} source(s) ({})",
@@ -499,6 +507,32 @@ impl Daemon {
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
+
+    /// Multi-source allow-all grant: one approval covers every listed source,
+    /// then each source is upgraded or established under the same lease.
+    fn authorize_allow_all_batch(&self, sources: &[Source], ttl: Duration) -> Result<(), Response> {
+        if !self.gate.approve(&allow_all_sources_prompt(sources, ttl)) {
+            return Err(Response::Denied {
+                reason: format!("allow-all not approved for {} source(s)", sources.len()),
+            });
+        }
+
+        for src in sources {
+            let source = src.key();
+            if self.state.lock().unwrap().live(source).is_some() {
+                self.state.lock().unwrap().set_allow_all(source, ttl);
+                continue;
+            }
+
+            let values = src.values()?;
+            self.state
+                .lock()
+                .unwrap()
+                .add(source.to_string(), values, ttl, true);
+        }
+
+        Ok(())
+    }
 }
 
 /// Synthetic source-key prefix for AWS-profile grants (`aws:<profile>`). These
@@ -541,6 +575,14 @@ impl Source {
         }
     }
 
+    /// Compact single-line label for multi-source approval prompts.
+    fn batch_label(&self) -> String {
+        match self {
+            Source::Env { path, .. } => format!("secrets in {}", path.display()),
+            Source::Aws { profile, .. } => format!("AWS profile {profile}"),
+        }
+    }
+
     /// Produce this source's name→value map, or a `Response` to return verbatim
     /// on failure (so error detail / CLI stderr never folds into a grant).
     fn values(&self) -> Result<HashMap<String, String>, Response> {
@@ -579,6 +621,19 @@ fn allow_all_prompt(src: &Source, ttl: Duration) -> String {
         src.subject(),
         humanize_secs(ttl.as_secs())
     )
+}
+
+fn allow_all_sources_prompt(sources: &[Source], ttl: Duration) -> String {
+    let mut prompt = format!(
+        "Allow ALL commands to use {} sources\nfor {}, without confirming each one.\nSources:",
+        sources.len(),
+        humanize_secs(ttl.as_secs())
+    );
+    for src in sources {
+        prompt.push_str("\n  - ");
+        prompt.push_str(&src.batch_label());
+    }
+    prompt
 }
 
 /// Turn the client's `--env` paths and `--aws-profile` names into resolved
@@ -776,6 +831,7 @@ fn parse_env_no_export(text: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn parses_env_no_export_lines() {
@@ -835,6 +891,30 @@ mod tests {
         }
     }
 
+    struct RecordingGate {
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ApprovalGate for RecordingGate {
+        fn approve(&self, prompt: &str) -> bool {
+            self.prompts.lock().unwrap().push(prompt.to_string());
+            true
+        }
+    }
+
+    fn recording_daemon() -> (Daemon, Arc<Mutex<Vec<String>>>) {
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        (
+            Daemon {
+                state: Mutex::new(State::default()),
+                gate: Box::new(RecordingGate {
+                    prompts: prompts.clone(),
+                }),
+            },
+            prompts,
+        )
+    }
+
     /// A peer whose pid is this test process, so `cwd()` resolves successfully.
     /// (`grant_all` itself performs no uid check.)
     fn self_peer() -> Peer {
@@ -880,6 +960,51 @@ mod tests {
     }
 
     #[test]
+    fn grant_all_multiple_sources_uses_one_prompt() {
+        let dir = std::env::temp_dir().join(format!("sx-batch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_one = dir.join("one.env");
+        let env_two = dir.join("two.env");
+        std::fs::write(&env_one, "ONE=1\n").unwrap();
+        std::fs::write(&env_two, "TWO=2\n").unwrap();
+
+        let (daemon, prompts) = recording_daemon();
+        let resp = daemon.grant_all(
+            vec![
+                env_one.to_string_lossy().into_owned(),
+                env_two.to_string_lossy().into_owned(),
+            ],
+            vec![],
+            Some(1800),
+            &self_peer(),
+        );
+
+        match resp {
+            Response::Ok { message } => assert!(
+                message.contains("2 source(s)"),
+                "message should reflect the source count: {message}"
+            ),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "expected one batch approval prompt");
+        assert!(prompts[0].contains("Allow ALL commands to use 2 sources"));
+        assert!(prompts[0].contains(&env_one.display().to_string()));
+        assert!(prompts[0].contains(&env_two.display().to_string()));
+        drop(prompts);
+
+        let info = daemon.state.lock().unwrap().info();
+        assert_eq!(info.len(), 2);
+        assert!(info.iter().all(|g| g.allow_all));
+        assert!(info
+            .iter()
+            .all(|g| g.expires_in_secs > 1700 && g.expires_in_secs <= 1800));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn grant_all_rejects_lease_over_max() {
         let daemon = allow_all_daemon();
         // The lease check fires before any source resolution or minting, so an
@@ -915,5 +1040,25 @@ mod tests {
         // A custom lease is rendered human-readably in both prompts.
         assert!(allow_all_prompt(&src, Duration::from_secs(86_400)).contains("for 1 day,"));
         assert!(allow_all_prompt(&src, Duration::from_secs(1800)).contains("for 30 minutes,"));
+    }
+
+    #[test]
+    fn batch_allow_all_prompt_lists_aws_profiles() {
+        let sources = vec![
+            Source::Aws {
+                key: format!("{AWS_SOURCE_PREFIX}dev/readonly-no-secrets"),
+                profile: "dev/readonly-no-secrets".to_string(),
+            },
+            Source::Aws {
+                key: format!("{AWS_SOURCE_PREFIX}prod/readonly-no-secrets"),
+                profile: "prod/readonly-no-secrets".to_string(),
+            },
+        ];
+
+        let prompt = allow_all_sources_prompt(&sources, Duration::from_secs(43_200));
+        assert!(prompt.contains("Allow ALL commands to use 2 sources"));
+        assert!(prompt.contains("for 12 hours"));
+        assert!(prompt.contains("AWS profile dev/readonly-no-secrets"));
+        assert!(prompt.contains("AWS profile prod/readonly-no-secrets"));
     }
 }

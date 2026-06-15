@@ -277,13 +277,15 @@ impl Daemon {
                 env,
                 aws_profiles,
                 lease_secs,
-            } => self.grant_all(env, aws_profiles, lease_secs, peer),
+                renew,
+            } => self.grant_all(env, aws_profiles, lease_secs, renew, peer),
             Request::Run {
                 env,
                 aws_profiles,
                 argv,
                 grant_all,
-            } => self.run(env, aws_profiles, argv, grant_all, peer),
+                renew,
+            } => self.run(env, aws_profiles, argv, grant_all, renew, peer),
         }
     }
 
@@ -313,11 +315,16 @@ impl Daemon {
 
     /// Pre-authorize sources in allow-all mode (no command). Prompts once per
     /// source to grant it for the window with the per-command prompt suppressed.
+    ///
+    /// A source that already has a live allow-all window is reused silently;
+    /// `renew` overrides that and starts a fresh window (re-prompt, re-read/mint,
+    /// reset the lease).
     fn grant_all(
         &self,
         env: Vec<String>,
         aws_profiles: Vec<String>,
         lease_secs: Option<u64>,
+        renew: bool,
         peer: &Peer,
     ) -> Response {
         if env.is_empty() && aws_profiles.is_empty() {
@@ -348,12 +355,12 @@ impl Daemon {
         let count = sources.len();
 
         if count > 1 {
-            if let Err(resp) = self.authorize_allow_all_batch(&sources, ttl) {
+            if let Err(resp) = self.authorize_allow_all_batch(&sources, ttl, renew) {
                 return resp;
             }
         } else {
             for src in &sources {
-                if let Err(resp) = self.authorize(src, None, true, ttl) {
+                if let Err(resp) = self.authorize(src, None, true, ttl, renew) {
                     return resp;
                 }
             }
@@ -375,6 +382,7 @@ impl Daemon {
         aws_profiles: Vec<String>,
         argv: Vec<String>,
         grant_all: bool,
+        renew: bool,
         peer: &Peer,
     ) -> Response {
         if argv.is_empty() {
@@ -400,7 +408,7 @@ impl Daemon {
         let ttl = Duration::from_secs(GRANT_TTL_SECS);
         let mut merged: Vec<(String, String)> = Vec::new();
         for src in &sources {
-            let values = match self.authorize(src, Some(&argv), grant_all, ttl) {
+            let values = match self.authorize(src, Some(&argv), grant_all, ttl, renew) {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
@@ -422,6 +430,12 @@ impl Daemon {
     ///   `Some`, prompt to approve this specific command. `make_allow_all`
     ///   upgrades a live confirm-mode grant to allow-all (prompted) instead.
     ///
+    /// A live allow-all window is *reused silently*: re-requesting `grant-all`
+    /// against it is a no-op, not a re-prompt. `renew` overrides that and forces
+    /// a fresh window — re-prompting, re-reading/minting the values, and
+    /// resetting the lease even when one is live (only meaningful with
+    /// `make_allow_all`).
+    ///
     /// `argv == None` means "pre-authorize only" (no command to confirm).
     /// `Err(Response)` carries a denial/error to return verbatim.
     ///
@@ -434,6 +448,7 @@ impl Daemon {
         argv: Option<&[String]>,
         make_allow_all: bool,
         ttl: Duration,
+        renew: bool,
     ) -> Result<Vec<(String, String)>, Response> {
         let source = src.key();
         let live = self.state.lock().unwrap().live(source);
@@ -443,12 +458,22 @@ impl Daemon {
             return self.establish_grant(src, argv, make_allow_all, ttl);
         };
 
-        // Already allow-all, and not asked to change → no prompt.
-        if live.allow_all && !make_allow_all {
+        // `--renew` on an allow-all request starts over: re-prompt, re-read/mint,
+        // and reset the lease, discarding the live window. Establishing fresh
+        // keeps a single, well-tested grant path.
+        if renew && make_allow_all {
+            return self.establish_grant(src, argv, true, ttl);
+        }
+
+        // A live allow-all window is reused without prompting — including a
+        // repeated `grant-all`/`--grant-all` against it (matching the window
+        // that already exists is a no-op, not a re-prompt).
+        if live.allow_all {
             return Ok(live.values);
         }
 
-        // Asked to upgrade a confirm-mode grant to allow-all.
+        // Live grant is confirm-mode. Asked to upgrade it to allow-all → prompt
+        // (a genuine escalation from "confirm each command" to "allow all").
         if make_allow_all {
             if !self.gate.approve(&allow_all_prompt(src, ttl)) {
                 return Err(Response::Denied {
@@ -510,7 +535,33 @@ impl Daemon {
 
     /// Multi-source allow-all grant: one approval covers every listed source,
     /// then each source is upgraded or established under the same lease.
-    fn authorize_allow_all_batch(&self, sources: &[Source], ttl: Duration) -> Result<(), Response> {
+    ///
+    /// A source that already has a live allow-all window is reused untouched, so
+    /// if *every* source is already allow-all (and `renew` is false) this is a
+    /// silent no-op with no prompt. `renew` forces a fresh window for all of
+    /// them — re-prompting, re-reading/minting, and resetting the lease.
+    fn authorize_allow_all_batch(
+        &self,
+        sources: &[Source],
+        ttl: Duration,
+        renew: bool,
+    ) -> Result<(), Response> {
+        // A source needs (re)granting unless it already has a live allow-all
+        // window we can reuse as-is. `--renew` forces every source to re-grant.
+        let needs_grant = |src: &Source| {
+            renew
+                || !self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .live(src.key())
+                    .map(|g| g.allow_all)
+                    .unwrap_or(false)
+        };
+        if !sources.iter().any(needs_grant) {
+            return Ok(());
+        }
+
         if !self.gate.approve(&allow_all_sources_prompt(sources, ttl)) {
             return Err(Response::Denied {
                 reason: format!("allow-all not approved for {} source(s)", sources.len()),
@@ -519,16 +570,23 @@ impl Daemon {
 
         for src in sources {
             let source = src.key();
-            if self.state.lock().unwrap().live(source).is_some() {
-                self.state.lock().unwrap().set_allow_all(source, ttl);
-                continue;
+            let live = self.state.lock().unwrap().live(source);
+            match live {
+                // Reuse an existing allow-all window untouched (unless renewing).
+                Some(g) if g.allow_all && !renew => continue,
+                // Upgrade a live confirm-mode grant in place, keeping its values.
+                Some(_) if !renew => {
+                    self.state.lock().unwrap().set_allow_all(source, ttl);
+                }
+                // Fresh or renewed: (re-)read/mint and store under the new lease.
+                _ => {
+                    let values = src.values()?;
+                    self.state
+                        .lock()
+                        .unwrap()
+                        .add(source.to_string(), values, ttl, true);
+                }
             }
-
-            let values = src.values()?;
-            self.state
-                .lock()
-                .unwrap()
-                .add(source.to_string(), values, ttl, true);
         }
 
         Ok(())
@@ -936,6 +994,7 @@ mod tests {
             vec![env_path.to_string_lossy().into_owned()],
             vec![],
             Some(1800),
+            false,
             &self_peer(),
         );
         match resp {
@@ -976,6 +1035,7 @@ mod tests {
             ],
             vec![],
             Some(1800),
+            false,
             &self_peer(),
         );
 
@@ -1013,6 +1073,7 @@ mod tests {
             vec![],
             vec!["prod".to_string()],
             Some(GRANT_TTL_MAX_SECS + 1),
+            false,
             &self_peer(),
         );
         match resp {
@@ -1060,5 +1121,100 @@ mod tests {
         assert!(prompt.contains("for 12 hours"));
         assert!(prompt.contains("AWS profile dev/readonly-no-secrets"));
         assert!(prompt.contains("AWS profile prod/readonly-no-secrets"));
+    }
+
+    #[test]
+    fn grant_all_reuses_live_window_without_reprompting() {
+        let dir = std::env::temp_dir().join(format!("sx-reuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join(".env");
+        std::fs::write(&env_path, "FOO=bar\n").unwrap();
+        let arg = env_path.to_string_lossy().into_owned();
+
+        let (daemon, prompts) = recording_daemon();
+
+        // First grant-all establishes the window: one prompt.
+        daemon.grant_all(vec![arg.clone()], vec![], None, false, &self_peer());
+        assert_eq!(prompts.lock().unwrap().len(), 1, "first grant-all prompts");
+
+        // Re-issuing grant-all against the live window reuses it — no new prompt.
+        daemon.grant_all(vec![arg.clone()], vec![], None, false, &self_peer());
+        daemon.grant_all(vec![arg], vec![], None, false, &self_peer());
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            1,
+            "reusing a live allow-all window must not re-prompt"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn grant_all_renew_reprompts_and_rereads_values() {
+        let dir = std::env::temp_dir().join(format!("sx-renew-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join(".env");
+        std::fs::write(&env_path, "FOO=one\n").unwrap();
+        let arg = env_path.to_string_lossy().into_owned();
+        let key = env_path.canonicalize().unwrap().display().to_string();
+
+        let (daemon, prompts) = recording_daemon();
+
+        daemon.grant_all(vec![arg.clone()], vec![], None, false, &self_peer());
+        assert_eq!(prompts.lock().unwrap().len(), 1);
+
+        // --renew re-prompts and re-reads the source even though a window is live.
+        std::fs::write(&env_path, "FOO=two\n").unwrap();
+        daemon.grant_all(vec![arg], vec![], None, true, &self_peer());
+        assert_eq!(prompts.lock().unwrap().len(), 2, "--renew must re-prompt");
+
+        let live = daemon.state.lock().unwrap().live(&key).unwrap();
+        assert_eq!(
+            live.values,
+            vec![("FOO".to_string(), "two".to_string())],
+            "--renew must re-read the source's values"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn grant_all_batch_reuses_when_all_live_then_renews() {
+        let dir = std::env::temp_dir().join(format!("sx-batch-reuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let one = dir.join("one.env");
+        let two = dir.join("two.env");
+        std::fs::write(&one, "ONE=1\n").unwrap();
+        std::fs::write(&two, "TWO=2\n").unwrap();
+        let args = || {
+            vec![
+                one.to_string_lossy().into_owned(),
+                two.to_string_lossy().into_owned(),
+            ]
+        };
+
+        let (daemon, prompts) = recording_daemon();
+
+        // First batch grant-all: one approval for both sources.
+        daemon.grant_all(args(), vec![], None, false, &self_peer());
+        assert_eq!(prompts.lock().unwrap().len(), 1);
+
+        // Both windows already live → re-issuing is a silent no-op (no prompt).
+        daemon.grant_all(args(), vec![], None, false, &self_peer());
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            1,
+            "reusing live windows in a batch must not re-prompt"
+        );
+
+        // --renew forces a fresh batch approval.
+        daemon.grant_all(args(), vec![], None, true, &self_peer());
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            2,
+            "--renew re-prompts the batch"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

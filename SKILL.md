@@ -71,6 +71,10 @@ sx run --env .env --aws-profile prod -- ./deploy.sh
   window (e.g. `30m`, `2h`, `1d`; default 1h, max 24h), and can batch repeated
   sources into one prompt, e.g.
   `sx grant-all --aws-profile dev/ro --aws-profile prod/ro --lease 12h`.
+- An allow-all window is reused: running `sx grant-all` again for a source that
+  still has a live window just reuses it (no second prompt). Only
+  `sx grant-all --renew …` starts a fresh window early (re-prompts, resets the
+  lease). You won't normally need `--renew`.
 
 ## Quick reference
 

@@ -237,8 +237,9 @@ The daemon never trusts what the client *says* about its identity or location.
 On each connection it reads the peer's credentials from the kernel via the
 socket:
 
-- **uid** via `getpeereid` — connections from any uid other than the daemon's
-  own are refused, so only the owning user can reach their secrets.
+- **uid** via `getpeereid` (macOS) / `SO_PEERCRED` (Linux) — connections from
+  any uid other than the daemon's own are refused, so only the owning user can
+  reach their secrets.
 - **pid** via `LOCAL_PEERPID` (macOS) / `SO_PEERCRED` (Linux), from which the
   daemon derives the caller's **verified cwd** (`proc_pidinfo` /
   `PROC_PIDVNODEPATHINFO` on macOS, `/proc/<pid>/cwd` on Linux).

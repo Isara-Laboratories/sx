@@ -7,9 +7,8 @@
 //! with `RunAtLoad` + `KeepAlive` it starts at login and respawns if it dies.
 
 use std::io;
-use std::path::Path;
-
 /// launchd / service label (reverse-DNS-ish).
+#[cfg(target_os = "macos")]
 const LABEL: &str = "dev.sx.sxd";
 
 /// Install and start the auto-start service. `dry_run` prints what would happen

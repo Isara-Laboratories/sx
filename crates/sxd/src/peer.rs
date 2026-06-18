@@ -40,7 +40,8 @@ pub fn own_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-/// Peer effective uid via `getpeereid` (portable across macOS and Linux).
+/// Peer effective uid via `getpeereid`.
+#[cfg(target_os = "macos")]
 fn peer_uid(fd: i32) -> io::Result<u32> {
     let mut uid: libc::uid_t = 0;
     let mut gid: libc::gid_t = 0;
@@ -50,6 +51,32 @@ fn peer_uid(fd: i32) -> io::Result<u32> {
         return Err(io::Error::last_os_error());
     }
     Ok(uid as u32)
+}
+
+#[cfg(target_os = "linux")]
+fn peer_cred(fd: i32) -> io::Result<libc::ucred> {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // Safety: valid socket fd; buffer/len sized to a ucred.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(cred)
+}
+
+/// Peer uid via `SO_PEERCRED`.
+#[cfg(target_os = "linux")]
+fn peer_uid(fd: i32) -> io::Result<u32> {
+    Ok(peer_cred(fd)?.uid as u32)
 }
 
 #[cfg(target_os = "macos")]
@@ -74,22 +101,7 @@ fn peer_pid(fd: i32) -> io::Result<i32> {
 
 #[cfg(target_os = "linux")]
 fn peer_pid(fd: i32) -> io::Result<i32> {
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // Safety: valid socket fd; buffer/len sized to a ucred.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(cred.pid)
+    Ok(peer_cred(fd)?.pid)
 }
 
 /// macOS: derive cwd from a pid via `proc_pidinfo(PROC_PIDVNODEPATHINFO)`.
@@ -136,4 +148,20 @@ fn pid_cwd(_pid: i32) -> io::Result<PathBuf> {
         io::ErrorKind::Unsupported,
         "peer cwd derivation not supported on this platform",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_from_stream_reads_linux_socket_credentials() {
+        let (_client, server) = UnixStream::pair().unwrap();
+
+        let peer = Peer::from_stream(&server).unwrap();
+
+        assert_eq!(peer.uid, own_uid());
+        assert_eq!(peer.pid, std::process::id() as i32);
+    }
 }

@@ -63,8 +63,8 @@ sx run --env .env --aws-profile prod -- ./deploy.sh
   `.env` — a sandbox may block reading the file directly anyway.
 - If `sx run` prints `denied:`, the user declined the prompt — **stop and ask**,
   don't retry in a loop.
-- Per-command confirmation is the default. If the user is doing many `sx run`
-  calls and wants to skip the prompts, they (not you) can run
+- Per-command confirmation is the default. If you are going to do many `sx run`
+  calls and you want to skip the prompts, you can run ofr a single prompt for an hour,
   `sx grant-all --env <file>` or `sx grant-all --aws-profile <profile>` once to
   allow that source for an hour — suggest it, but don't assume it, since it
   lowers their security. `grant-all` also takes `--lease <duration>` to set the
@@ -85,7 +85,7 @@ sx run --env .env --aws-profile prod -- ./deploy.sh
 | Run a command with an AWS profile | `sx run --aws-profile prod -- <cmd>` |
 | Mix files and profiles | `sx run --env .env --aws-profile prod -- <cmd>` |
 | See available names (no values) | `sx status` |
-| (user only) allow a file without per-command prompts | `sx grant-all --env .env` |
-| (user only) allow a profile without per-command prompts | `sx grant-all --aws-profile prod` |
-| (user only) revoke a file early | `sx clear .env` |
-| (user only) revoke a profile early | `sx clear --aws-profile prod` |
+| allow a file without per-command prompts | `sx grant-all --env .env` |
+| allow a profile without per-command prompts | `sx grant-all --aws-profile prod` |
+| revoke a file early | `sx clear .env` |
+| revoke a profile early | `sx clear --aws-profile prod` |

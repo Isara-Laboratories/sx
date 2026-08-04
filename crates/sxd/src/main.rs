@@ -27,7 +27,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -39,7 +40,9 @@ use state::State;
 
 struct Daemon {
     state: Mutex<State>,
-    gate: Box<dyn ApprovalGate>,
+    // Only one human approval prompt can be active at a time. Connection
+    // workers that do not need approval do not take this lock.
+    gate: Mutex<Box<dyn ApprovalGate>>,
 }
 
 fn main() -> Result<()> {
@@ -113,23 +116,37 @@ fn main() -> Result<()> {
 
     eprintln!("sxd listening on {}", socket.display());
 
-    let daemon = Daemon {
+    let daemon = Arc::new(Daemon {
         state: Mutex::new(State::default()),
-        gate,
-    };
+        gate: Mutex::new(gate),
+    });
 
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
-                if let Err(e) = daemon.handle(stream) {
-                    eprintln!("sxd: connection error: {e:#}");
-                }
+                // A wait for human approval can take any amount of time.
+                // Keep accepting connections so status, clear, and requests
+                // covered by an allow-all grant can continue meanwhile.
+                drop(spawn_connection(&daemon, stream));
             }
             Err(e) => eprintln!("sxd: accept error: {e}"),
         }
     }
 
     Ok(())
+}
+
+/// Handle one client on an independent worker.
+///
+/// The accept loop drops the returned handle and does not wait for the worker.
+/// Tests keep the handle so they can wait for the worker to finish.
+fn spawn_connection(daemon: &Arc<Daemon>, stream: UnixStream) -> thread::JoinHandle<()> {
+    let daemon = Arc::clone(daemon);
+    thread::spawn(move || {
+        if let Err(e) = daemon.handle(stream) {
+            eprintln!("sxd: connection error: {e:#}");
+        }
+    })
 }
 
 /// Discover the `aws` CLI on the current PATH and persist its absolute path to
@@ -475,7 +492,7 @@ impl Daemon {
         // Live grant is confirm-mode. Asked to upgrade it to allow-all → prompt
         // (a genuine escalation from "confirm each command" to "allow all").
         if make_allow_all {
-            if !self.gate.approve(&allow_all_prompt(src, ttl)) {
+            if !self.approve(&allow_all_prompt(src, ttl)) {
                 return Err(Response::Denied {
                     reason: format!("allow-all not approved for {source}"),
                 });
@@ -486,7 +503,7 @@ impl Daemon {
 
         // Confirm-mode grant + a command → per-command gate.
         let argv = argv.expect("confirm-mode path always has a command");
-        if !self.gate.approve(&per_command_prompt(src, argv)) {
+        if !self.approve(&per_command_prompt(src, argv)) {
             return Err(Response::Denied {
                 reason: "command not approved".to_string(),
             });
@@ -513,7 +530,7 @@ impl Daemon {
         } else {
             first_run_prompt(src, argv, ttl)
         };
-        if !self.gate.approve(&prompt) {
+        if !self.approve(&prompt) {
             return Err(Response::Denied {
                 reason: format!("grant not approved for {}", src.key()),
             });
@@ -562,7 +579,7 @@ impl Daemon {
             return Ok(());
         }
 
-        if !self.gate.approve(&allow_all_sources_prompt(sources, ttl)) {
+        if !self.approve(&allow_all_sources_prompt(sources, ttl)) {
             return Err(Response::Denied {
                 reason: format!("allow-all not approved for {} source(s)", sources.len()),
             });
@@ -590,6 +607,11 @@ impl Daemon {
         }
 
         Ok(())
+    }
+
+    /// Run one human approval prompt at a time.
+    fn approve(&self, prompt: &str) -> bool {
+        self.gate.lock().unwrap().approve(prompt)
     }
 }
 
@@ -889,7 +911,7 @@ fn parse_env_no_export(text: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc};
 
     #[test]
     fn parses_env_no_export_lines() {
@@ -945,7 +967,7 @@ mod tests {
     fn allow_all_daemon() -> Daemon {
         Daemon {
             state: Mutex::new(State::default()),
-            gate: Box::new(AllowAllGate),
+            gate: Mutex::new(Box::new(AllowAllGate)),
         }
     }
 
@@ -960,14 +982,38 @@ mod tests {
         }
     }
 
+    struct BlockingGate {
+        started: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl ApprovalGate for BlockingGate {
+        fn approve(&self, _prompt: &str) -> bool {
+            self.started.send(()).unwrap();
+            self.release.lock().unwrap().recv().is_ok()
+        }
+    }
+
+    fn write_request(stream: &mut UnixStream, request: &Request) {
+        serde_json::to_writer(&mut *stream, request).unwrap();
+        stream.write_all(b"\n").unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn read_response(stream: &mut UnixStream) -> Result<Response> {
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        Ok(serde_json::from_str(line.trim())?)
+    }
+
     fn recording_daemon() -> (Daemon, Arc<Mutex<Vec<String>>>) {
         let prompts = Arc::new(Mutex::new(Vec::new()));
         (
             Daemon {
                 state: Mutex::new(State::default()),
-                gate: Box::new(RecordingGate {
+                gate: Mutex::new(Box::new(RecordingGate {
                     prompts: prompts.clone(),
-                }),
+                })),
             },
             prompts,
         )
@@ -980,6 +1026,89 @@ mod tests {
             uid: 0,
             pid: std::process::id() as i32,
         }
+    }
+
+    #[test]
+    fn pending_approval_does_not_block_other_requests() {
+        let dir =
+            std::env::temp_dir().join(format!("sx-concurrent-approval-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join(".env");
+        std::fs::write(&env_path, "FOO=bar\n").unwrap();
+        let approved_env_path = dir.join("approved.env");
+        std::fs::write(&approved_env_path, "READY=yes\n").unwrap();
+        let approved_source = approved_env_path
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let daemon = Arc::new(Daemon {
+            state: Mutex::new(State::default()),
+            gate: Mutex::new(Box::new(BlockingGate {
+                started: started_tx,
+                release: Mutex::new(release_rx),
+            })),
+        });
+        daemon.state.lock().unwrap().add(
+            approved_source,
+            HashMap::from([("READY".to_string(), "yes".to_string())]),
+            Duration::from_secs(GRANT_TTL_SECS),
+            true,
+        );
+
+        let (mut approval_client, approval_server) = UnixStream::pair().unwrap();
+        let approval_worker = spawn_connection(&daemon, approval_server);
+        write_request(
+            &mut approval_client,
+            &Request::GrantAll {
+                env: vec![env_path.to_string_lossy().into_owned()],
+                aws_profiles: vec![],
+                lease_secs: None,
+                renew: false,
+            },
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("approval did not start");
+
+        let (mut status_client, status_server) = UnixStream::pair().unwrap();
+        status_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let status_worker = spawn_connection(&daemon, status_server);
+        write_request(&mut status_client, &Request::Status);
+        let status_response = read_response(&mut status_client);
+
+        let (mut run_client, run_server) = UnixStream::pair().unwrap();
+        run_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let run_worker = spawn_connection(&daemon, run_server);
+        write_request(
+            &mut run_client,
+            &Request::Run {
+                env: vec![approved_env_path.to_string_lossy().into_owned()],
+                aws_profiles: vec![],
+                argv: vec!["true".to_string()],
+                grant_all: false,
+                renew: false,
+            },
+        );
+        let run_response = read_response(&mut run_client);
+
+        release_tx.send(()).unwrap();
+        let approval_response = read_response(&mut approval_client).unwrap();
+        approval_worker.join().unwrap();
+        status_worker.join().unwrap();
+        run_worker.join().unwrap();
+
+        assert!(matches!(status_response.unwrap(), Response::Status { .. }));
+        assert!(matches!(run_response.unwrap(), Response::Granted { .. }));
+        assert!(matches!(approval_response, Response::Ok { .. }));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

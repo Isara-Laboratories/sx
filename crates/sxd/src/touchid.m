@@ -34,8 +34,8 @@ int sx_touchid_authenticate(const char *reason) {
         }
 
         // evaluatePolicy is asynchronous; block this thread on a semaphore
-        // until the completion handler fires. The daemon serves connections
-        // serially, so blocking here is fine.
+        // until the completion handler fires. The daemon lets only one approval
+        // call run at a time. Other connection workers continue during the wait.
         dispatch_semaphore_t sema = dispatch_semaphore_create(0);
         __block BOOL approved = NO;
 

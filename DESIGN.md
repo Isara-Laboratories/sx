@@ -261,6 +261,10 @@ The grant gate is an `ApprovalGate` trait with three implementations:
 - **`CliGate` (`--cli-gate`, default off-macOS).** Yes/no on the daemon's TTY.
 - **`AllowAllGate` (`--no-gate`).** Tests only.
 
+The daemon handles each socket connection on an independent worker. A pending
+approval does not block `status`, `clear`, or a `run` request that already has
+an allow-all grant. Only one human approval prompt can be active at a time.
+
 ## Known v1 simplifications (tracked, not hidden)
 
 - **`sx` identity is not yet attested.** The plaintext is released to whatever

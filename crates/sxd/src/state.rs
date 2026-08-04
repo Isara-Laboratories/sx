@@ -68,6 +68,18 @@ impl State {
         }
     }
 
+    /// Replace a live grant's values without changing its mode or expiry.
+    /// Returns false when the grant expired or was cleared before the update.
+    pub fn replace_values(&mut self, source: &str, values: HashMap<String, String>) -> bool {
+        self.purge_expired();
+        if let Some(g) = self.grants.iter_mut().find(|c| c.source == source) {
+            g.values = values;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Remove a single source's grant, or all of them when `path` is `None`.
     /// Returns how many grants were removed.
     pub fn clear(&mut self, path: Option<&str>) -> usize {

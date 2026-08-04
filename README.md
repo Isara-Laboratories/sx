@@ -69,12 +69,17 @@ sx grant-all --aws-profile dev/readonly --aws-profile prod/readonly --lease 12h
 sx status                             # granted files + mode + names (never values)
 sx clear .env                         # revoke early
 
-# AWS profiles are a second source: sxd mints temporary credentials for the
-# named profile and injects them, gated and TTL'd exactly like a .env grant.
+# AWS profiles are a second source. The grant controls access to the profile.
+# sxd refreshes temporary credentials before they expire without extending the grant.
 sx run --aws-profile prod -- aws s3 ls          # 1st use: grant + confirm; SSO/role/static all work
 sx run --env .env --aws-profile prod -- deploy  # merge both sources in one run
 sx clear --aws-profile prod                     # revoke a single profile grant
 ```
+
+For temporary AWS credentials, `sxd` uses `AWS_CREDENTIAL_EXPIRATION` from the
+AWS CLI and refreshes the credentials when five minutes remain. This refresh
+does not require a new approval and does not extend the grant lease. Static
+credentials have no expiration value and are not refreshed.
 
 ## Teaching agents to use it
 

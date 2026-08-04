@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sx_proto::{humanize_secs, socket_path, Request, Response, GRANT_TTL_MAX_SECS, GRANT_TTL_SECS};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use gate::{AllowAllGate, ApprovalGate, CliGate};
 use peer::Peer;
@@ -43,7 +44,14 @@ struct Daemon {
     // Only one human approval prompt can be active at a time. Connection
     // workers that do not need approval do not take this lock.
     gate: Mutex<Box<dyn ApprovalGate>>,
+    /// Serialize refreshes per AWS profile. A command that reaches the refresh
+    /// boundary rechecks the stored values after it acquires this lock, so
+    /// concurrent commands share one AWS CLI invocation.
+    aws_refresh_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    aws_minter: Arc<AwsMinter>,
 }
+
+type AwsMinter = dyn Fn(&str) -> Result<HashMap<String, String>, Response> + Send + Sync;
 
 fn main() -> Result<()> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -116,10 +124,7 @@ fn main() -> Result<()> {
 
     eprintln!("sxd listening on {}", socket.display());
 
-    let daemon = Arc::new(Daemon {
-        state: Mutex::new(State::default()),
-        gate: Mutex::new(gate),
-    });
+    let daemon = Arc::new(Daemon::new(gate));
 
     for conn in listener.incoming() {
         match conn {
@@ -218,6 +223,19 @@ fn default_gate() -> Box<dyn ApprovalGate> {
 }
 
 impl Daemon {
+    fn new(gate: Box<dyn ApprovalGate>) -> Self {
+        Self::with_aws_minter(gate, Arc::new(mint_aws))
+    }
+
+    fn with_aws_minter(gate: Box<dyn ApprovalGate>, aws_minter: Arc<AwsMinter>) -> Self {
+        Self {
+            state: Mutex::new(State::default()),
+            gate: Mutex::new(gate),
+            aws_refresh_locks: Mutex::new(HashMap::new()),
+            aws_minter,
+        }
+    }
+
     /// Authenticate the peer, read one request, dispatch it, write one response.
     fn handle(&self, stream: UnixStream) -> Result<()> {
         let response = self.authenticate_and_dispatch(&stream);
@@ -468,53 +486,58 @@ impl Daemon {
         renew: bool,
     ) -> Result<Vec<(String, String)>, Response> {
         let source = src.key();
+        let is_run = argv.is_some();
         let live = self.state.lock().unwrap().live(source);
 
         // First use of this source → file-grant gate (reads/mints fresh).
         let Some(live) = live else {
-            return self.establish_grant(src, argv, make_allow_all, ttl);
+            let values = self.establish_grant(src, argv, make_allow_all, ttl)?;
+            return self.finish_authorization(src, values, is_run);
         };
 
         // `--renew` on an allow-all request starts over: re-prompt, re-read/mint,
         // and reset the lease, discarding the live window. Establishing fresh
         // keeps a single, well-tested grant path.
         if renew && make_allow_all {
-            return self.establish_grant(src, argv, true, ttl);
+            let values = self.establish_grant(src, argv, true, ttl)?;
+            return self.finish_authorization(src, values, is_run);
         }
 
         // A live allow-all window is reused without prompting — including a
         // repeated `grant-all`/`--grant-all` against it (matching the window
         // that already exists is a no-op, not a re-prompt).
-        if live.allow_all {
-            return Ok(live.values);
-        }
-
-        // Live grant is confirm-mode. Asked to upgrade it to allow-all → prompt
-        // (a genuine escalation from "confirm each command" to "allow all").
-        if make_allow_all {
+        let values = if live.allow_all {
+            live.values
+        } else if make_allow_all {
+            // Live grant is confirm-mode. Asked to upgrade it to allow-all →
+            // prompt because this is a genuine escalation.
             if !self.approve(&allow_all_prompt(src, ttl)) {
                 return Err(Response::Denied {
                     reason: format!("allow-all not approved for {source}"),
                 });
             }
             self.state.lock().unwrap().set_allow_all(source, ttl);
-            return Ok(live.values);
-        }
+            live.values
+        } else {
+            // Confirm-mode grant + a command → per-command gate.
+            let argv = argv.expect("confirm-mode path always has a command");
+            if !self.approve(&per_command_prompt(src, argv)) {
+                return Err(Response::Denied {
+                    reason: "command not approved".to_string(),
+                });
+            }
+            // Re-resolve after approval: the grant may have expired at the prompt.
+            match self.state.lock().unwrap().live(source) {
+                Some(g) => g.values,
+                None => {
+                    return Err(Response::Denied {
+                        reason: format!("grant for {source} expired during approval"),
+                    })
+                }
+            }
+        };
 
-        // Confirm-mode grant + a command → per-command gate.
-        let argv = argv.expect("confirm-mode path always has a command");
-        if !self.approve(&per_command_prompt(src, argv)) {
-            return Err(Response::Denied {
-                reason: "command not approved".to_string(),
-            });
-        }
-        // Re-resolve after approval: the grant may have expired at the prompt.
-        match self.state.lock().unwrap().live(source) {
-            Some(g) => Ok(g.values),
-            None => Err(Response::Denied {
-                reason: format!("grant for {source} expired during approval"),
-            }),
-        }
+        self.finish_authorization(src, values, is_run)
     }
 
     /// First-use grant: prompt, read/mint the source's values, store them.
@@ -538,7 +561,7 @@ impl Daemon {
 
         // Read/mint values only AFTER approval. On failure return the carried
         // Response verbatim so any CLI stderr never enters a successful grant.
-        let values = src.values()?;
+        let values = self.source_values(src)?;
 
         self.state
             .lock()
@@ -597,7 +620,7 @@ impl Daemon {
                 }
                 // Fresh or renewed: (re-)read/mint and store under the new lease.
                 _ => {
-                    let values = src.values()?;
+                    let values = self.source_values(src)?;
                     self.state
                         .lock()
                         .unwrap()
@@ -613,11 +636,120 @@ impl Daemon {
     fn approve(&self, prompt: &str) -> bool {
         self.gate.lock().unwrap().approve(prompt)
     }
+
+    fn source_values(&self, src: &Source) -> Result<HashMap<String, String>, Response> {
+        match src {
+            Source::Env { path, key } => parse_env(path).map_err(|e| Response::Error {
+                message: format!("reading {key}: {e:#}"),
+            }),
+            Source::Aws { profile, .. } => (self.aws_minter)(profile),
+        }
+    }
+
+    fn finish_authorization(
+        &self,
+        src: &Source,
+        values: Vec<(String, String)>,
+        is_run: bool,
+    ) -> Result<Vec<(String, String)>, Response> {
+        if is_run {
+            self.refresh_aws_if_needed(src, values)
+        } else {
+            Ok(values)
+        }
+    }
+
+    /// Refresh temporary AWS credentials near their provider-reported expiry.
+    /// This changes only the cached values; it never extends the human grant.
+    fn refresh_aws_if_needed(
+        &self,
+        src: &Source,
+        values: Vec<(String, String)>,
+    ) -> Result<Vec<(String, String)>, Response> {
+        let Source::Aws { profile, .. } = src else {
+            return Ok(values);
+        };
+        if !aws_credentials_need_refresh(&values, OffsetDateTime::now_utc())? {
+            return Ok(values);
+        }
+
+        let source = src.key();
+        let refresh_lock = {
+            let mut locks = self.aws_refresh_locks.lock().unwrap();
+            Arc::clone(
+                locks
+                    .entry(source.to_string())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _refresh_guard = refresh_lock.lock().unwrap();
+
+        // Another command may have refreshed this profile while this command
+        // waited for the lock. Re-read the grant before starting the AWS CLI.
+        let current = self
+            .state
+            .lock()
+            .unwrap()
+            .live(source)
+            .ok_or_else(|| Response::Denied {
+                reason: format!("grant for {source} expired before credential refresh"),
+            })?;
+        if !aws_credentials_need_refresh(&current.values, OffsetDateTime::now_utc())? {
+            return Ok(current.values);
+        }
+
+        let refreshed = (self.aws_minter)(profile)?;
+        let refreshed_values = sorted_values(&refreshed);
+        if aws_credentials_need_refresh(&refreshed_values, OffsetDateTime::now_utc())? {
+            return Err(Response::Error {
+                message: format!(
+                    "AWS CLI returned credentials for profile {profile} that expire within {} minutes",
+                    AWS_REFRESH_WINDOW_SECS / 60
+                ),
+            });
+        }
+
+        if !self.state.lock().unwrap().replace_values(source, refreshed) {
+            return Err(Response::Denied {
+                reason: format!("grant for {source} expired during credential refresh"),
+            });
+        }
+        Ok(refreshed_values)
+    }
 }
 
 /// Synthetic source-key prefix for AWS-profile grants (`aws:<profile>`). These
 /// keys are never filesystem paths and must bypass `resolve`/`canonicalize`.
 const AWS_SOURCE_PREFIX: &str = "aws:";
+const AWS_CREDENTIAL_EXPIRATION: &str = "AWS_CREDENTIAL_EXPIRATION";
+const AWS_REFRESH_WINDOW_SECS: i64 = 5 * 60;
+
+fn sorted_values(values: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut values: Vec<(String, String)> = values
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    values.sort_by(|a, b| a.0.cmp(&b.0));
+    values
+}
+
+/// Return true when temporary AWS credentials expire within the refresh
+/// window. Credentials without an expiration are static and need no refresh.
+fn aws_credentials_need_refresh(
+    values: &[(String, String)],
+    now: OffsetDateTime,
+) -> Result<bool, Response> {
+    let Some((_, expiration)) = values
+        .iter()
+        .find(|(name, _)| name == AWS_CREDENTIAL_EXPIRATION)
+    else {
+        return Ok(false);
+    };
+    let expiration = OffsetDateTime::parse(expiration, &Rfc3339).map_err(|e| Response::Error {
+        message: format!("AWS CLI returned an invalid {AWS_CREDENTIAL_EXPIRATION}: {e}"),
+    })?;
+    Ok(expiration <= now + time::Duration::seconds(AWS_REFRESH_WINDOW_SECS))
+}
 
 /// A resolved secret source: a canonical `.env` file path, or a named AWS
 /// profile. This is the one place that differs between backends — the State
@@ -660,17 +792,6 @@ impl Source {
         match self {
             Source::Env { path, .. } => format!("secrets in {}", path.display()),
             Source::Aws { profile, .. } => format!("AWS profile {profile}"),
-        }
-    }
-
-    /// Produce this source's name→value map, or a `Response` to return verbatim
-    /// on failure (so error detail / CLI stderr never folds into a grant).
-    fn values(&self) -> Result<HashMap<String, String>, Response> {
-        match self {
-            Source::Env { path, key } => parse_env(path).map_err(|e| Response::Error {
-                message: format!("reading {key}: {e:#}"),
-            }),
-            Source::Aws { profile, .. } => mint_aws(profile),
         }
     }
 }
@@ -911,7 +1032,10 @@ fn parse_env_no_export(text: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{mpsc, Arc};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc, Barrier,
+    };
 
     #[test]
     fn parses_env_no_export_lines() {
@@ -933,6 +1057,99 @@ mod tests {
         let map = parse_env_no_export("\n  \nNOEQUALS\nA=1\n");
         assert_eq!(map.len(), 1);
         assert_eq!(map["A"], "1");
+    }
+
+    fn aws_test_values(expiration: Option<&str>, access_key: &str) -> HashMap<String, String> {
+        let mut values = HashMap::from([
+            ("AWS_ACCESS_KEY_ID".to_string(), access_key.to_string()),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "dummy-not-a-secret".to_string(),
+            ),
+        ]);
+        if let Some(expiration) = expiration {
+            values.insert(
+                AWS_CREDENTIAL_EXPIRATION.to_string(),
+                expiration.to_string(),
+            );
+        }
+        values
+    }
+
+    #[test]
+    fn aws_refresh_uses_provider_expiration_and_safety_window() {
+        let now = OffsetDateTime::parse("2026-08-04T12:00:00Z", &Rfc3339).unwrap();
+        let static_values = sorted_values(&aws_test_values(None, "static"));
+        let outside_window = sorted_values(&aws_test_values(
+            Some("2026-08-04T12:05:01+00:00"),
+            "temporary",
+        ));
+        let at_window = sorted_values(&aws_test_values(
+            Some("2026-08-04T12:05:00.000Z"),
+            "temporary",
+        ));
+
+        assert!(!aws_credentials_need_refresh(&static_values, now).unwrap());
+        assert!(!aws_credentials_need_refresh(&outside_window, now).unwrap());
+        assert!(aws_credentials_need_refresh(&at_window, now).unwrap());
+    }
+
+    #[test]
+    fn invalid_aws_expiration_is_an_error() {
+        let values = sorted_values(&aws_test_values(Some("not-a-time"), "temporary"));
+        let result = aws_credentials_need_refresh(&values, OffsetDateTime::now_utc());
+        assert!(matches!(result, Err(Response::Error { .. })));
+    }
+
+    #[test]
+    fn concurrent_runs_share_one_aws_refresh_without_extending_grant() {
+        const WORKERS: usize = 8;
+        let source_key = format!("{AWS_SOURCE_PREFIX}benchmark");
+        let old = aws_test_values(Some("2000-01-01T00:00:00Z"), "old");
+        let fresh = aws_test_values(Some("2099-01-01T00:00:00Z"), "fresh");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_minter = Arc::clone(&calls);
+        let minter: Arc<AwsMinter> = Arc::new(move |_profile| {
+            calls_for_minter.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(fresh.clone())
+        });
+        let daemon = Arc::new(Daemon::with_aws_minter(Box::new(AllowAllGate), minter));
+        daemon.state.lock().unwrap().add(
+            source_key.clone(),
+            old.clone(),
+            Duration::from_secs(3600),
+            true,
+        );
+        let expires_before = daemon.state.lock().unwrap().info()[0].expires_in_secs;
+
+        let barrier = Arc::new(Barrier::new(WORKERS + 1));
+        let mut workers = Vec::new();
+        for _ in 0..WORKERS {
+            let daemon = Arc::clone(&daemon);
+            let barrier = Arc::clone(&barrier);
+            let old_values = sorted_values(&old);
+            workers.push(std::thread::spawn(move || {
+                let src = Source::Aws {
+                    key: format!("{AWS_SOURCE_PREFIX}benchmark"),
+                    profile: "benchmark".to_string(),
+                };
+                barrier.wait();
+                daemon.refresh_aws_if_needed(&src, old_values).unwrap()
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            let values = worker.join().unwrap();
+            assert!(values
+                .iter()
+                .any(|(name, value)| name == "AWS_ACCESS_KEY_ID" && value == "fresh"));
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let info = daemon.state.lock().unwrap().info();
+        assert!(info[0].allow_all);
+        assert!(info[0].expires_in_secs <= expires_before);
     }
 
     #[test]
@@ -965,10 +1182,7 @@ mod tests {
     }
 
     fn allow_all_daemon() -> Daemon {
-        Daemon {
-            state: Mutex::new(State::default()),
-            gate: Mutex::new(Box::new(AllowAllGate)),
-        }
+        Daemon::new(Box::new(AllowAllGate))
     }
 
     struct RecordingGate {
@@ -1009,12 +1223,9 @@ mod tests {
     fn recording_daemon() -> (Daemon, Arc<Mutex<Vec<String>>>) {
         let prompts = Arc::new(Mutex::new(Vec::new()));
         (
-            Daemon {
-                state: Mutex::new(State::default()),
-                gate: Mutex::new(Box::new(RecordingGate {
-                    prompts: prompts.clone(),
-                })),
-            },
+            Daemon::new(Box::new(RecordingGate {
+                prompts: prompts.clone(),
+            })),
             prompts,
         )
     }
@@ -1045,13 +1256,10 @@ mod tests {
 
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let daemon = Arc::new(Daemon {
-            state: Mutex::new(State::default()),
-            gate: Mutex::new(Box::new(BlockingGate {
-                started: started_tx,
-                release: Mutex::new(release_rx),
-            })),
-        });
+        let daemon = Arc::new(Daemon::new(Box::new(BlockingGate {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        })));
         daemon.state.lock().unwrap().add(
             approved_source,
             HashMap::from([("READY".to_string(), "yes".to_string())]),

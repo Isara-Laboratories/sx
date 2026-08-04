@@ -160,12 +160,15 @@ pub enum Request {
     /// * `aws_profiles` — named AWS profiles; the daemon mints temporary
     ///   credentials by shelling out to `aws configure export-credentials` and
     ///   injects the resulting `AWS_*` env vars. Keyed under `aws:<profile>`,
-    ///   never touched by filesystem resolution.
+    ///   never touched by filesystem resolution. During a live grant, the
+    ///   daemon refreshes credentials near their provider-reported expiration
+    ///   without extending the grant.
     ///
     /// Two independent gates apply to every source:
     ///
     /// * **file grant** — on first use of a source, a 1h TouchID grant reads
-    ///   (or mints) its values into memory; later runs reuse them.
+    ///   (or mints) its values into memory; later runs reuse them. Temporary AWS
+    ///   values can refresh inside the same grant.
     /// * **per-command** — by default *every* run prompts to approve this
     ///   specific command. A source in allow-all mode (via [`Request::GrantAll`]
     ///   or `grant_all` here) skips this prompt for its window. Re-running with

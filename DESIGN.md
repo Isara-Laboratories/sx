@@ -89,8 +89,9 @@ sandbox — see "Trusting `sx`" below.
 
 - **`sx-proto`** — newline-delimited JSON wire types (`Request`/`Response`) and
   the agreed socket path (`$SX_SOCKET`, else `$HOME/.sx/sxd.sock`).
-- **`sxd`** — the daemon / secrets oracle. Reads `.env`, gates grants, holds
-  granted secrets in memory with a 1h TTL. Never executes a command. Service
+- **`sxd`** — the daemon / secrets oracle. Reads `.env`, gates grants, and holds
+  granted values in memory. It refreshes temporary AWS credentials before they
+  expire without extending the grant. It never executes a command. Service
   subcommands: `install` (register the LaunchAgent + run `setup`), `setup`
   (resolve the `aws` CLI path into `~/.sx/config`), `uninstall`.
 - **`sx`** — the in-sandbox client. For `run`, it receives the granted values and
@@ -180,9 +181,9 @@ sx run --env .env -- gh pr create --title "..."
 ## Backends
 
 A *source* is anything the daemon can turn into a name→value map. Every source
-sits behind the same daemon, the same 1h grant/TTL, the same double gate, the
-same `status`/`clear`, and the same output redaction — they differ only in how
-values are produced and in the subject shown at the human prompt.
+sits behind the same daemon, grant lease, double gate, `status`/`clear`, and
+output redaction. They differ only in how values are produced and in the
+subject shown at the human prompt.
 
 - **`.env` (today).** Frictionless: point `--env` at a file in any project dir.
   Plaintext at rest — security rests on the daemon being outside the sandbox.
@@ -196,11 +197,16 @@ values are produced and in the subject shown at the human prompt.
   `AWS_SESSION_TOKEN`, and usually `AWS_CREDENTIAL_EXPIRATION` / `AWS_REGION`),
   injected verbatim. No AWS SDK is linked in. The grant is keyed under a
   synthetic `aws:<profile>` source (never a filesystem path, so it bypasses cwd
-  resolution/canonicalization) and held for the same 1h TTL; `sx clear
-  --aws-profile <name>` revokes it early. If `aws` is missing or exits non-zero,
-  the daemon returns the captured stderr as a denial/error — it never folds that
-  output into a successful grant. A single `sx run --env .env --aws-profile prod
-  -- cmd` runs every gate and merges both sources' values.
+  resolution/canonicalization). The grant lease controls how long the profile
+  can be used. Before each run, the daemon checks `AWS_CREDENTIAL_EXPIRATION`.
+  When five minutes remain, it asks the AWS CLI for new credentials and replaces
+  the cached values without extending the grant. A per-profile lock makes
+  concurrent runs share one refresh. Static credentials have no expiration and
+  are not refreshed. `sx clear --aws-profile <name>` revokes the grant early.
+  If `aws` is missing or exits non-zero, the daemon returns the captured stderr
+  as a denial/error. It never folds that output into a successful grant. A
+  single `sx run --env .env --aws-profile prod -- cmd` runs every gate and
+  merges both sources' values.
 
   **The `aws` CLI path is resolved once at setup, not searched at runtime.**
   launchd starts `sxd` as a LaunchAgent with a minimal `$PATH`

@@ -44,7 +44,9 @@ sx run --env .env --aws-profile prod -- ./deploy.sh
   static) and injects them as `AWS_*` env vars (`AWS_ACCESS_KEY_ID`,
   `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, usually
   `AWS_CREDENTIAL_EXPIRATION` / `AWS_REGION`). The values come back redacted in
-  output, same as `.env` secrets.
+  output, same as `.env` secrets. During a long grant, `sx` refreshes temporary
+  AWS credentials before they expire. The agent does not need to renew a live
+  grant only because its current AWS credentials are near expiration.
 - The first use of a source (file or profile) prompts the **user** (TouchID) to
   grant it for an hour; by default the user also confirms **each command**.
   These prompts go to the human, not to you.

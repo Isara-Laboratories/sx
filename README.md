@@ -59,7 +59,9 @@ sx run --env .env -- gh pr merge      # within the hour: still confirms THIS com
 sx grant-all --env .env               # one prompt, then its commands run unprompted
 sx run --env .env -- gh pr merge      # no prompt
 sx grant-all --env .env               # within the window: reuses it, no prompt
-sx grant-all --env .env --renew       # start a fresh window early (re-prompt, reset)
+sx grant-all --env .env --renew       # re-prompt, reload values, reset the window
+sx grant-all --env .env --refresh     # re-read values without changing the window
+sx run --env .env --refresh -- migrate # refresh the file, then stream the command
 
 # Pick a longer (or shorter) window with --lease (default 1h, max 24h):
 sx grant-all --env .env --lease 1d    # allow-all for a day; also accepts 30m, 2h, 5400
@@ -80,6 +82,10 @@ For temporary AWS credentials, `sxd` uses `AWS_CREDENTIAL_EXPIRATION` from the
 AWS CLI and refreshes the credentials when five minutes remain. This refresh
 does not require a new approval and does not extend the grant lease. Static
 credentials have no expiration value and are not refreshed.
+
+`sx run` streams stdout and stderr as the command runs, redacting secret values
+within each output chunk. Redaction is a guardrail against obvious accidental
+leaks; a value split across two read chunks may not be recognized.
 
 ## Teaching agents to use it
 

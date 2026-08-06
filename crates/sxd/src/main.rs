@@ -35,7 +35,7 @@ use anyhow::{Context, Result};
 use sx_proto::{humanize_secs, socket_path, Request, Response, GRANT_TTL_MAX_SECS, GRANT_TTL_SECS};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use gate::{AllowAllGate, ApprovalGate, CliGate};
+use gate::{AllowAllGate, Approval, ApprovalGate, CliGate};
 use peer::Peer;
 use state::State;
 
@@ -52,6 +52,12 @@ struct Daemon {
 }
 
 type AwsMinter = dyn Fn(&str) -> Result<HashMap<String, String>, Response> + Send + Sync;
+
+struct RunOptions {
+    grant_all: bool,
+    renew: bool,
+    refresh: bool,
+}
 
 fn main() -> Result<()> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -313,14 +319,26 @@ impl Daemon {
                 aws_profiles,
                 lease_secs,
                 renew,
-            } => self.grant_all(env, aws_profiles, lease_secs, renew, peer),
+                refresh,
+            } => self.grant_all(env, aws_profiles, lease_secs, renew, refresh, peer),
             Request::Run {
                 env,
                 aws_profiles,
                 argv,
                 grant_all,
                 renew,
-            } => self.run(env, aws_profiles, argv, grant_all, renew, peer),
+                refresh,
+            } => self.run(
+                env,
+                aws_profiles,
+                argv,
+                RunOptions {
+                    grant_all,
+                    renew,
+                    refresh,
+                },
+                peer,
+            ),
         }
     }
 
@@ -352,20 +370,27 @@ impl Daemon {
     /// source to grant it for the window with the per-command prompt suppressed.
     ///
     /// A source that already has a live allow-all window is reused silently;
-    /// `renew` overrides that and starts a fresh window (re-prompt, re-read/mint,
-    /// reset the lease).
+    /// `renew` overrides that and starts a fresh window (re-prompt, reload
+    /// credentials, and reset the lease). `refresh` only re-reads env files and
+    /// preserves a live window.
     fn grant_all(
         &self,
         env: Vec<String>,
         aws_profiles: Vec<String>,
         lease_secs: Option<u64>,
         renew: bool,
+        refresh: bool,
         peer: &Peer,
     ) -> Response {
         if env.is_empty() && aws_profiles.is_empty() {
             return Response::Error {
                 message: "grant-all requires at least one --env <path> or --aws-profile <profile>"
                     .to_string(),
+            };
+        }
+        if refresh && env.is_empty() {
+            return Response::Error {
+                message: "--refresh requires at least one --env <path>".to_string(),
             };
         }
 
@@ -390,12 +415,12 @@ impl Daemon {
         let count = sources.len();
 
         if count > 1 {
-            if let Err(resp) = self.authorize_allow_all_batch(&sources, ttl, renew) {
+            if let Err(resp) = self.authorize_allow_all_batch(&sources, ttl, renew, refresh) {
                 return resp;
             }
         } else {
             for src in &sources {
-                if let Err(resp) = self.authorize(src, None, true, ttl, renew) {
+                if let Err(resp) = self.authorize(src, None, true, ttl, renew, refresh) {
                     return resp;
                 }
             }
@@ -416,10 +441,14 @@ impl Daemon {
         env: Vec<String>,
         aws_profiles: Vec<String>,
         argv: Vec<String>,
-        grant_all: bool,
-        renew: bool,
+        options: RunOptions,
         peer: &Peer,
     ) -> Response {
+        let RunOptions {
+            grant_all,
+            renew,
+            refresh,
+        } = options;
         if argv.is_empty() {
             return Response::Error {
                 message: "run requires a command".to_string(),
@@ -429,6 +458,11 @@ impl Daemon {
             return Response::Error {
                 message: "run requires at least one --env <path> or --aws-profile <profile>"
                     .to_string(),
+            };
+        }
+        if refresh && env.is_empty() {
+            return Response::Error {
+                message: "--refresh requires at least one --env <path>".to_string(),
             };
         }
 
@@ -443,7 +477,7 @@ impl Daemon {
         let ttl = Duration::from_secs(GRANT_TTL_SECS);
         let mut merged: Vec<(String, String)> = Vec::new();
         for src in &sources {
-            let values = match self.authorize(src, Some(&argv), grant_all, ttl, renew) {
+            let values = match self.authorize(src, Some(&argv), grant_all, ttl, renew, refresh) {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
@@ -467,9 +501,8 @@ impl Daemon {
     ///
     /// A live allow-all window is *reused silently*: re-requesting `grant-all`
     /// against it is a no-op, not a re-prompt. `renew` overrides that and forces
-    /// a fresh window — re-prompting, re-reading/minting the values, and
-    /// resetting the lease even when one is live (only meaningful with
-    /// `make_allow_all`).
+    /// a fresh window — re-prompting, reloading credentials, and resetting the
+    /// lease even when one is live (only meaningful with `make_allow_all`).
     ///
     /// `argv == None` means "pre-authorize only" (no command to confirm).
     /// `Err(Response)` carries a denial/error to return verbatim.
@@ -484,6 +517,7 @@ impl Daemon {
         make_allow_all: bool,
         ttl: Duration,
         renew: bool,
+        refresh: bool,
     ) -> Result<Vec<(String, String)>, Response> {
         let source = src.key();
         let is_run = argv.is_some();
@@ -495,9 +529,8 @@ impl Daemon {
             return self.finish_authorization(src, values, is_run);
         };
 
-        // `--renew` on an allow-all request starts over: re-prompt, re-read/mint,
-        // and reset the lease, discarding the live window. Establishing fresh
-        // keeps a single, well-tested grant path.
+        // `--renew` on an allow-all request starts over: re-prompt, reload the
+        // source's credentials, and reset the lease.
         if renew && make_allow_all {
             let values = self.establish_grant(src, argv, true, ttl)?;
             return self.finish_authorization(src, values, is_run);
@@ -511,21 +544,19 @@ impl Daemon {
         } else if make_allow_all {
             // Live grant is confirm-mode. Asked to upgrade it to allow-all →
             // prompt because this is a genuine escalation.
-            if !self.approve(&allow_all_prompt(src, ttl)) {
-                return Err(Response::Denied {
-                    reason: format!("allow-all not approved for {source}"),
-                });
-            }
+            self.approve(
+                &allow_all_prompt(src, ttl),
+                format!("allow-all not approved for {source}"),
+            )?;
             self.state.lock().unwrap().set_allow_all(source, ttl);
             live.values
         } else {
             // Confirm-mode grant + a command → per-command gate.
             let argv = argv.expect("confirm-mode path always has a command");
-            if !self.approve(&per_command_prompt(src, argv)) {
-                return Err(Response::Denied {
-                    reason: "command not approved".to_string(),
-                });
-            }
+            self.approve(
+                &per_command_prompt(src, argv),
+                "command not approved".to_string(),
+            )?;
             // Re-resolve after approval: the grant may have expired at the prompt.
             match self.state.lock().unwrap().live(source) {
                 Some(g) => g.values,
@@ -537,6 +568,11 @@ impl Daemon {
             }
         };
 
+        let values = if refresh && matches!(src, Source::Env { .. }) {
+            self.refresh_env(src)?
+        } else {
+            values
+        };
         self.finish_authorization(src, values, is_run)
     }
 
@@ -553,11 +589,7 @@ impl Daemon {
         } else {
             first_run_prompt(src, argv, ttl)
         };
-        if !self.approve(&prompt) {
-            return Err(Response::Denied {
-                reason: format!("grant not approved for {}", src.key()),
-            });
-        }
+        self.approve(&prompt, format!("grant not approved for {}", src.key()))?;
 
         // Read/mint values only AFTER approval. On failure return the carried
         // Response verbatim so any CLI stderr never enters a successful grant.
@@ -578,16 +610,18 @@ impl Daemon {
     ///
     /// A source that already has a live allow-all window is reused untouched, so
     /// if *every* source is already allow-all (and `renew` is false) this is a
-    /// silent no-op with no prompt. `renew` forces a fresh window for all of
-    /// them — re-prompting, re-reading/minting, and resetting the lease.
+    /// silent no-op with no prompt. `renew` forces a fresh lease for all of
+    /// them — re-prompting, reloading credentials, and resetting expiry.
     fn authorize_allow_all_batch(
         &self,
         sources: &[Source],
         ttl: Duration,
         renew: bool,
+        refresh: bool,
     ) -> Result<(), Response> {
-        // A source needs (re)granting unless it already has a live allow-all
-        // window we can reuse as-is. `--renew` forces every source to re-grant.
+        // A source needs authorization unless it already has a live allow-all
+        // window we can reuse as-is. `--renew` reloads and re-grants every
+        // source.
         let needs_grant = |src: &Source| {
             renew
                 || !self
@@ -602,23 +636,30 @@ impl Daemon {
             return Ok(());
         }
 
-        if !self.approve(&allow_all_sources_prompt(sources, ttl)) {
-            return Err(Response::Denied {
-                reason: format!("allow-all not approved for {} source(s)", sources.len()),
-            });
-        }
+        self.approve(
+            &allow_all_sources_prompt(sources, ttl),
+            format!("allow-all not approved for {} source(s)", sources.len()),
+        )?;
 
         for src in sources {
             let source = src.key();
             let live = self.state.lock().unwrap().live(source);
             match live {
                 // Reuse an existing allow-all window untouched (unless renewing).
-                Some(g) if g.allow_all && !renew => continue,
+                Some(g) if g.allow_all && !renew => {
+                    if refresh && matches!(src, Source::Env { .. }) {
+                        self.refresh_env(src)?;
+                    }
+                    continue;
+                }
                 // Upgrade a live confirm-mode grant in place, keeping its values.
                 Some(_) if !renew => {
                     self.state.lock().unwrap().set_allow_all(source, ttl);
+                    if refresh && matches!(src, Source::Env { .. }) {
+                        self.refresh_env(src)?;
+                    }
                 }
-                // Fresh or renewed: (re-)read/mint and store under the new lease.
+                // Fresh or renewed: reload credentials and store a new lease.
                 _ => {
                     let values = self.source_values(src)?;
                     self.state
@@ -632,9 +673,31 @@ impl Daemon {
         Ok(())
     }
 
+    /// Re-read one env source and replace only its cached values. The state
+    /// update deliberately preserves the grant's expiry and confirmation mode.
+    fn refresh_env(&self, src: &Source) -> Result<Vec<(String, String)>, Response> {
+        debug_assert!(matches!(src, Source::Env { .. }));
+        let values = self.source_values(src)?;
+        let out = sorted_values(&values);
+        if !self.state.lock().unwrap().replace_values(src.key(), values) {
+            return Err(Response::Denied {
+                reason: format!("grant for {} expired during refresh", src.key()),
+            });
+        }
+        Ok(out)
+    }
+
     /// Run one human approval prompt at a time.
-    fn approve(&self, prompt: &str) -> bool {
-        self.gate.lock().unwrap().approve(prompt)
+    fn approve(&self, prompt: &str, denied_reason: String) -> Result<(), Response> {
+        match self.gate.lock().unwrap().approve(prompt) {
+            Approval::Approved => Ok(()),
+            Approval::Denied => Err(Response::Denied {
+                reason: denied_reason,
+            }),
+            Approval::TimedOut => Err(Response::Timeout {
+                reason: "user did not approve in time".to_string(),
+            }),
+        }
     }
 
     fn source_values(&self, src: &Source) -> Result<HashMap<String, String>, Response> {
@@ -1190,9 +1253,9 @@ mod tests {
     }
 
     impl ApprovalGate for RecordingGate {
-        fn approve(&self, prompt: &str) -> bool {
+        fn approve(&self, prompt: &str) -> Approval {
             self.prompts.lock().unwrap().push(prompt.to_string());
-            true
+            Approval::Approved
         }
     }
 
@@ -1202,9 +1265,21 @@ mod tests {
     }
 
     impl ApprovalGate for BlockingGate {
-        fn approve(&self, _prompt: &str) -> bool {
+        fn approve(&self, _prompt: &str) -> Approval {
             self.started.send(()).unwrap();
-            self.release.lock().unwrap().recv().is_ok()
+            if self.release.lock().unwrap().recv().is_ok() {
+                Approval::Approved
+            } else {
+                Approval::Denied
+            }
+        }
+    }
+
+    struct TimedOutGate;
+
+    impl ApprovalGate for TimedOutGate {
+        fn approve(&self, _prompt: &str) -> Approval {
+            Approval::TimedOut
         }
     }
 
@@ -1276,6 +1351,7 @@ mod tests {
                 aws_profiles: vec![],
                 lease_secs: None,
                 renew: false,
+                refresh: false,
             },
         );
         started_rx
@@ -1303,6 +1379,7 @@ mod tests {
                 argv: vec!["true".to_string()],
                 grant_all: false,
                 renew: false,
+                refresh: false,
             },
         );
         let run_response = read_response(&mut run_client);
@@ -1320,6 +1397,30 @@ mod tests {
     }
 
     #[test]
+    fn approval_timeout_has_an_agent_actionable_message() {
+        let dir = std::env::temp_dir().join(format!("sx-timeout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join(".env");
+        std::fs::write(&env_path, "FOO=bar\n").unwrap();
+        let daemon = Daemon::new(Box::new(TimedOutGate));
+
+        let response = daemon.grant_all(
+            vec![env_path.to_string_lossy().into_owned()],
+            vec![],
+            None,
+            false,
+            false,
+            &self_peer(),
+        );
+        assert!(matches!(
+            response,
+            Response::Timeout { reason } if reason == "user did not approve in time"
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn grant_all_with_custom_lease_uses_it() {
         let dir = std::env::temp_dir().join(format!("sx-lease-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1331,6 +1432,7 @@ mod tests {
             vec![env_path.to_string_lossy().into_owned()],
             vec![],
             Some(1800),
+            false,
             false,
             &self_peer(),
         );
@@ -1373,6 +1475,7 @@ mod tests {
             vec![],
             Some(1800),
             false,
+            false,
             &self_peer(),
         );
 
@@ -1410,6 +1513,7 @@ mod tests {
             vec![],
             vec!["prod".to_string()],
             Some(GRANT_TTL_MAX_SECS + 1),
+            false,
             false,
             &self_peer(),
         );
@@ -1471,12 +1575,12 @@ mod tests {
         let (daemon, prompts) = recording_daemon();
 
         // First grant-all establishes the window: one prompt.
-        daemon.grant_all(vec![arg.clone()], vec![], None, false, &self_peer());
+        daemon.grant_all(vec![arg.clone()], vec![], None, false, false, &self_peer());
         assert_eq!(prompts.lock().unwrap().len(), 1, "first grant-all prompts");
 
         // Re-issuing grant-all against the live window reuses it — no new prompt.
-        daemon.grant_all(vec![arg.clone()], vec![], None, false, &self_peer());
-        daemon.grant_all(vec![arg], vec![], None, false, &self_peer());
+        daemon.grant_all(vec![arg.clone()], vec![], None, false, false, &self_peer());
+        daemon.grant_all(vec![arg], vec![], None, false, false, &self_peer());
         assert_eq!(
             prompts.lock().unwrap().len(),
             1,
@@ -1487,7 +1591,7 @@ mod tests {
     }
 
     #[test]
-    fn grant_all_renew_reprompts_and_rereads_values() {
+    fn grant_all_renew_reprompts_refreshes_values_and_resets_lease() {
         let dir = std::env::temp_dir().join(format!("sx-renew-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let env_path = dir.join(".env");
@@ -1497,22 +1601,202 @@ mod tests {
 
         let (daemon, prompts) = recording_daemon();
 
-        daemon.grant_all(vec![arg.clone()], vec![], None, false, &self_peer());
+        daemon.grant_all(
+            vec![arg.clone()],
+            vec![],
+            Some(1800),
+            false,
+            false,
+            &self_peer(),
+        );
         assert_eq!(prompts.lock().unwrap().len(), 1);
+        assert!(daemon.state.lock().unwrap().info()[0].expires_in_secs <= 1800);
 
-        // --renew re-prompts and re-reads the source even though a window is live.
+        // --renew re-prompts, reloads credentials, and resets the lease.
         std::fs::write(&env_path, "FOO=two\n").unwrap();
-        daemon.grant_all(vec![arg], vec![], None, true, &self_peer());
+        daemon.grant_all(vec![arg], vec![], None, true, false, &self_peer());
         assert_eq!(prompts.lock().unwrap().len(), 2, "--renew must re-prompt");
+        assert!(
+            daemon.state.lock().unwrap().info()[0].expires_in_secs > 3500,
+            "--renew must reset the lease to the requested duration"
+        );
 
         let live = daemon.state.lock().unwrap().live(&key).unwrap();
         assert_eq!(
             live.values,
             vec![("FOO".to_string(), "two".to_string())],
-            "--renew must re-read the source's values"
+            "--renew must reload cached values"
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn grant_all_renew_re_mints_aws_credentials() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_minter = Arc::clone(&calls);
+        let minter: Arc<AwsMinter> = Arc::new(move |_profile| {
+            let call = calls_for_minter.fetch_add(1, Ordering::SeqCst);
+            Ok(aws_test_values(
+                None,
+                if call == 0 { "old" } else { "fresh" },
+            ))
+        });
+        let daemon = Daemon::with_aws_minter(Box::new(AllowAllGate), minter);
+
+        daemon.grant_all(
+            vec![],
+            vec!["prod".to_string()],
+            None,
+            false,
+            false,
+            &self_peer(),
+        );
+        daemon.grant_all(
+            vec![],
+            vec!["prod".to_string()],
+            None,
+            true,
+            false,
+            &self_peer(),
+        );
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let live = daemon.state.lock().unwrap().live("aws:prod").unwrap();
+        assert!(live
+            .values
+            .iter()
+            .any(|(name, value)| name == "AWS_ACCESS_KEY_ID" && value == "fresh"));
+    }
+
+    #[test]
+    fn refresh_updates_run_cache_without_changing_lease_or_mode() {
+        let dir = std::env::temp_dir().join(format!("sx-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join(".env");
+        std::fs::write(&env_path, "FOO=one\n").unwrap();
+        let arg = env_path.to_string_lossy().into_owned();
+        let key = env_path.canonicalize().unwrap().display().to_string();
+
+        let (daemon, prompts) = recording_daemon();
+        let response = daemon.run(
+            vec![arg.clone()],
+            vec![],
+            vec!["true".to_string()],
+            RunOptions {
+                grant_all: false,
+                renew: false,
+                refresh: false,
+            },
+            &self_peer(),
+        );
+        assert!(matches!(response, Response::Granted { .. }));
+        let before = daemon.state.lock().unwrap().info().remove(0);
+        assert!(!before.allow_all);
+
+        std::fs::write(&env_path, "FOO=two\n").unwrap();
+        let response = daemon.run(
+            vec![arg],
+            vec![],
+            vec!["true".to_string()],
+            RunOptions {
+                grant_all: false,
+                renew: false,
+                refresh: true,
+            },
+            &self_peer(),
+        );
+        assert!(matches!(response, Response::Granted { .. }));
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            2,
+            "run still confirms commands"
+        );
+
+        let mut state = daemon.state.lock().unwrap();
+        let live = state.live(&key).unwrap();
+        assert_eq!(live.values, vec![("FOO".to_string(), "two".to_string())]);
+        assert!(!live.allow_all);
+        let after = state.info().remove(0);
+        assert!(after.expires_in_secs <= before.expires_in_secs);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn refresh_preserves_custom_allow_all_lease() {
+        let dir = std::env::temp_dir().join(format!("sx-refresh-lease-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join(".env");
+        std::fs::write(&env_path, "FOO=one\n").unwrap();
+        let arg = env_path.to_string_lossy().into_owned();
+
+        let daemon = allow_all_daemon();
+        daemon.grant_all(
+            vec![arg.clone()],
+            vec![],
+            Some(1800),
+            false,
+            false,
+            &self_peer(),
+        );
+        let before = daemon.state.lock().unwrap().info().remove(0);
+
+        std::fs::write(&env_path, "FOO=two\n").unwrap();
+        assert!(matches!(
+            daemon.grant_all(vec![arg], vec![], None, false, true, &self_peer()),
+            Response::Ok { .. }
+        ));
+        let after = daemon.state.lock().unwrap().info().remove(0);
+        assert!(after.allow_all);
+        assert!(after.expires_in_secs <= before.expires_in_secs);
+        assert!(after.expires_in_secs <= 1800);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn refresh_on_first_run_establishes_a_normal_grant() {
+        let dir = std::env::temp_dir().join(format!("sx-refresh-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join(".env");
+        std::fs::write(&env_path, "FOO=one\n").unwrap();
+
+        let daemon = allow_all_daemon();
+        let response = daemon.run(
+            vec![env_path.to_string_lossy().into_owned()],
+            vec![],
+            vec!["true".to_string()],
+            RunOptions {
+                grant_all: false,
+                renew: false,
+                refresh: true,
+            },
+            &self_peer(),
+        );
+        assert!(matches!(response, Response::Granted { .. }));
+        assert_eq!(daemon.state.lock().unwrap().info().len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn refresh_is_rejected_without_an_env_file() {
+        let response = allow_all_daemon().run(
+            vec![],
+            vec!["prod".to_string()],
+            vec!["true".to_string()],
+            RunOptions {
+                grant_all: false,
+                renew: false,
+                refresh: true,
+            },
+            &self_peer(),
+        );
+        assert!(matches!(
+            response,
+            Response::Error { message } if message == "--refresh requires at least one --env <path>"
+        ));
     }
 
     #[test]
@@ -1533,11 +1817,11 @@ mod tests {
         let (daemon, prompts) = recording_daemon();
 
         // First batch grant-all: one approval for both sources.
-        daemon.grant_all(args(), vec![], None, false, &self_peer());
+        daemon.grant_all(args(), vec![], None, false, false, &self_peer());
         assert_eq!(prompts.lock().unwrap().len(), 1);
 
         // Both windows already live → re-issuing is a silent no-op (no prompt).
-        daemon.grant_all(args(), vec![], None, false, &self_peer());
+        daemon.grant_all(args(), vec![], None, false, false, &self_peer());
         assert_eq!(
             prompts.lock().unwrap().len(),
             1,
@@ -1545,7 +1829,7 @@ mod tests {
         );
 
         // --renew forces a fresh batch approval.
-        daemon.grant_all(args(), vec![], None, true, &self_peer());
+        daemon.grant_all(args(), vec![], None, true, false, &self_peer());
         assert_eq!(
             prompts.lock().unwrap().len(),
             2,

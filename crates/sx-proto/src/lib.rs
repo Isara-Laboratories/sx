@@ -133,8 +133,8 @@ pub enum Request {
     ///
     /// If an allow-all window is already live for a source, re-issuing
     /// `grant-all` reuses it silently (no second prompt) unless `renew` is set,
-    /// which starts a fresh window — re-prompting, re-reading/minting the
-    /// values, and resetting the lease.
+    /// which starts a fresh window by re-prompting, reloading credentials, and
+    /// resetting the lease.
     GrantAll {
         env: Vec<String>,
         /// AWS profile names to mint temporary credentials from.
@@ -146,9 +146,13 @@ pub enum Request {
         #[serde(default)]
         lease_secs: Option<u64>,
         /// Force a fresh allow-all window even if one is already live: re-prompt,
-        /// re-read/mint the values, and reset the lease.
+        /// reload credentials, and reset the lease.
         #[serde(default)]
         renew: bool,
+        /// Re-read env files without changing existing grants. Has no effect on
+        /// AWS profiles; newly granted files are already read fresh.
+        #[serde(default)]
+        refresh: bool,
     },
 
     /// Request the secrets from one or more sources in order to run `argv`.
@@ -174,7 +178,7 @@ pub enum Request {
     ///   or `grant_all` here) skips this prompt for its window. Re-running with
     ///   `grant_all` against a source that is already allow-all is silent — it
     ///   reuses the live window rather than re-prompting — unless `renew` asks
-    ///   for a fresh one.
+    ///   to reload credentials and start a fresh lease.
     ///
     /// It returns the merged values via [`Response::Granted`]; the client (`sx`)
     /// injects them and execs `argv` itself. `argv` is sent so the daemon can
@@ -188,9 +192,13 @@ pub enum Request {
         /// Upgrade the sources used here to allow-all for the rest of their grant.
         grant_all: bool,
         /// With `grant_all`, force a fresh allow-all window even if one is live:
-        /// re-prompt, re-read/mint the values, and reset the lease.
+        /// re-prompt, reload credentials, and reset the lease.
         #[serde(default)]
         renew: bool,
+        /// Re-read env files without changing existing grants. Has no effect on
+        /// AWS profiles; newly granted files are already read fresh.
+        #[serde(default)]
+        refresh: bool,
     },
 }
 
@@ -212,6 +220,9 @@ pub enum Response {
 
     /// A gate (capture or per-use) refused, or a precondition failed.
     Denied { reason: String },
+
+    /// The user did not respond before an approval window elapsed.
+    Timeout { reason: String },
 
     /// The daemon hit an internal error handling the request.
     Error { message: String },

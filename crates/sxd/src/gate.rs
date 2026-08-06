@@ -13,8 +13,15 @@ use std::io::{self, BufRead, Write};
 
 /// Anything that can ask the user to approve an action.
 pub trait ApprovalGate: Send + Sync {
-    /// Show `prompt` and return whether the user approved.
-    fn approve(&self, prompt: &str) -> bool;
+    /// Show `prompt` and return how the approval attempt ended.
+    fn approve(&self, prompt: &str) -> Approval;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    Approved,
+    Denied,
+    TimedOut,
 }
 
 /// Approve by reading a yes/no answer on the daemon's own stdin.
@@ -24,7 +31,7 @@ pub trait ApprovalGate: Send + Sync {
 pub struct CliGate;
 
 impl ApprovalGate for CliGate {
-    fn approve(&self, prompt: &str) -> bool {
+    fn approve(&self, prompt: &str) -> Approval {
         let stderr = io::stderr();
         let mut err = stderr.lock();
         let _ = writeln!(err, "\n┌─ sx approval ─────────────────────────────");
@@ -36,9 +43,13 @@ impl ApprovalGate for CliGate {
 
         let mut line = String::new();
         if io::stdin().lock().read_line(&mut line).is_err() {
-            return false;
+            return Approval::Denied;
         }
-        matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+        if matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            Approval::Approved
+        } else {
+            Approval::Denied
+        }
     }
 }
 
@@ -46,8 +57,8 @@ impl ApprovalGate for CliGate {
 pub struct AllowAllGate;
 
 impl ApprovalGate for AllowAllGate {
-    fn approve(&self, _prompt: &str) -> bool {
-        true
+    fn approve(&self, _prompt: &str) -> Approval {
+        Approval::Approved
     }
 }
 
@@ -62,7 +73,8 @@ pub struct TouchIdGate {
 
 #[cfg(target_os = "macos")]
 extern "C" {
-    /// See `src/touchid.m`. Returns 1 = approved, 0 = denied, -1 = unevaluable.
+    /// See `src/touchid.m`. Returns 2 = timeout, 1 = approved, 0 = denied,
+    /// -1 = unevaluable.
     fn sx_touchid_authenticate(reason: *const std::os::raw::c_char) -> std::os::raw::c_int;
 }
 
@@ -75,7 +87,7 @@ impl TouchIdGate {
 
 #[cfg(target_os = "macos")]
 impl ApprovalGate for TouchIdGate {
-    fn approve(&self, prompt: &str) -> bool {
+    fn approve(&self, prompt: &str) -> Approval {
         // The sheet shows a single line, so flatten the multi-line prompt.
         let reason: String = prompt
             .split('\n')
@@ -84,12 +96,13 @@ impl ApprovalGate for TouchIdGate {
             .join(" — ");
         let c_reason = match std::ffi::CString::new(reason) {
             Ok(c) => c,
-            Err(_) => return false, // interior NUL — refuse rather than guess
+            Err(_) => return Approval::Denied, // interior NUL — refuse rather than guess
         };
         // Safety: passing a valid NUL-terminated C string; the shim copies it.
         match unsafe { sx_touchid_authenticate(c_reason.as_ptr()) } {
-            1 => true,
-            0 => false,
+            2 => Approval::TimedOut,
+            1 => Approval::Approved,
+            0 => Approval::Denied,
             _ => self.fallback.approve(prompt),
         }
     }

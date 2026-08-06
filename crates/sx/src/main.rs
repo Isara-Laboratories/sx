@@ -11,9 +11,11 @@
 
 mod skill;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::Arc;
+use std::thread;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -61,8 +63,8 @@ enum Cmd {
     /// 30m, 2h, 1d, or 5400.
     ///
     /// Re-running this while the window is still live just reuses it (no second
-    /// prompt). Pass --renew to start a fresh window early (re-prompt, reset the
-    /// lease).
+    /// prompt). Pass --renew to start a fresh window early (re-prompt, reload
+    /// credentials, and reset the lease).
     ///
     /// Example: sx grant-all --env .env --lease 1d
     GrantAll {
@@ -77,9 +79,12 @@ enum Cmd {
         #[arg(long = "lease", value_parser = parse_duration)]
         lease: Option<u64>,
         /// Start a fresh allow-all window even if one is still live: re-prompt,
-        /// re-read/mint the values, and reset the lease.
+        /// reload credentials, and reset the lease.
         #[arg(long)]
         renew: bool,
+        /// Re-read env files without changing a live grant's expiry or mode.
+        #[arg(long, requires = "env")]
+        refresh: bool,
     },
     /// Run a command with the secrets from one or more sources injected.
     ///
@@ -103,9 +108,12 @@ enum Cmd {
         #[arg(long = "grant-all")]
         grant_all: bool,
         /// With --grant-all, start a fresh allow-all window even if one is live:
-        /// re-prompt, re-read/mint the values, and reset the lease.
+        /// re-prompt, reload credentials, and reset the lease.
         #[arg(long, requires = "grant_all")]
         renew: bool,
+        /// Re-read env files without changing a live grant's expiry or mode.
+        #[arg(long, requires = "env")]
+        refresh: bool,
         /// The command and its arguments, after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
@@ -166,18 +174,20 @@ fn run() -> Result<ExitCode> {
             aws_profile,
             grant_all,
             renew,
+            refresh,
             argv,
         } => {
             if env.is_empty() && aws_profile.is_empty() {
                 anyhow::bail!("run requires at least one --env <path> or --aws-profile <profile>");
             }
-            exec_with_secrets(env, aws_profile, argv, grant_all, renew)
+            exec_with_secrets(env, aws_profile, argv, grant_all, renew, refresh)
         }
         Cmd::GrantAll {
             env,
             aws_profile,
             lease,
             renew,
+            refresh,
         } => {
             if env.is_empty() && aws_profile.is_empty() {
                 anyhow::bail!(
@@ -189,6 +199,7 @@ fn run() -> Result<ExitCode> {
                 aws_profiles: aws_profile,
                 lease_secs: lease,
                 renew,
+                refresh,
             })?))
         }
         Cmd::Clear { path, aws_profile } => {
@@ -227,6 +238,7 @@ fn exec_with_secrets(
     argv: Vec<String>,
     grant_all: bool,
     renew: bool,
+    refresh: bool,
 ) -> Result<ExitCode> {
     let response = send(&Request::Run {
         env,
@@ -234,6 +246,7 @@ fn exec_with_secrets(
         argv: argv.clone(),
         grant_all,
         renew,
+        refresh,
     })?;
 
     let granted = match response {
@@ -246,47 +259,77 @@ fn exec_with_secrets(
     for (name, value) in &granted {
         cmd.env(name, value);
     }
-    // Inherit stdin so commands that read input (pipes, prompts) work; capture
-    // stdout/stderr so we can redact the secret values out of them before they
-    // reach our own stdout (which the agent sees). `wait_with_output` drains
-    // both pipes concurrently, avoiding the classic pipe-buffer deadlock.
+    // Inherit stdin so commands that read input (pipes, prompts) work. Drain
+    // stdout and stderr concurrently, redacting and flushing each chunk as it
+    // arrives so long-running commands report progress live.
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = cmd
+    let mut child = cmd
         .spawn()
-        .with_context(|| format!("running {}", argv[0]))?
-        .wait_with_output()
-        .with_context(|| format!("waiting for {}", argv[0]))?;
+        .with_context(|| format!("running {}", argv[0]))?;
+    let stdout = child.stdout.take().context("capturing child stdout")?;
+    let stderr = child.stderr.take().context("capturing child stderr")?;
+    let values = Arc::new(
+        granted
+            .iter()
+            .filter(|(_, value)| !value.is_empty())
+            .map(|(_, value)| value.as_bytes().to_vec())
+            .collect::<Vec<_>>(),
+    );
+    let stdout_values = Arc::clone(&values);
+    let stdout_thread = thread::spawn(move || relay_redacted(stdout, io::stdout(), &stdout_values));
+    let stderr_thread = thread::spawn(move || relay_redacted(stderr, io::stderr(), &values));
 
-    // Redact the injected values from whatever the command emitted before it
-    // reaches our stdout/stderr (which the agent sees).
-    let values: Vec<&str> = granted.iter().map(|(_, v)| v.as_str()).collect();
-    print!(
-        "{}",
-        redact(String::from_utf8_lossy(&output.stdout), &values)
-    );
-    eprint!(
-        "{}",
-        redact(String::from_utf8_lossy(&output.stderr), &values)
-    );
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for {}", argv[0]))?;
+    stdout_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdout relay thread panicked"))??;
+    stderr_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr relay thread panicked"))??;
 
     Ok(ExitCode::from(
-        u8::try_from(output.status.code().unwrap_or(1)).unwrap_or(1),
+        u8::try_from(status.code().unwrap_or(1)).unwrap_or(1),
     ))
 }
 
-/// Replace every (non-empty) secret value in `text` with a placeholder.
-fn redact(text: std::borrow::Cow<'_, str>, values: &[&str]) -> String {
-    let mut text = text.into_owned();
-    for v in values {
-        if v.is_empty() {
-            continue;
+/// Relay one output stream live, redacting each read chunk independently.
+fn relay_redacted<R: Read, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    values: &[Vec<u8>],
+) -> io::Result<()> {
+    let mut buf = [0_u8; 8192];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
         }
-        text = text.replace(v, "‹redacted›");
+        let chunk = redact_chunk(&buf[..n], values);
+        writer.write_all(&chunk)?;
+        writer.flush()?;
     }
-    text
+}
+
+fn redact_chunk(chunk: &[u8], values: &[Vec<u8>]) -> Vec<u8> {
+    const REDACTED: &[u8] = "‹redacted›".as_bytes();
+    let mut output = chunk.to_vec();
+    for value in values {
+        let mut redacted = Vec::with_capacity(output.len());
+        let mut rest = output.as_slice();
+        while let Some(index) = rest.windows(value.len()).position(|window| window == value) {
+            redacted.extend_from_slice(&rest[..index]);
+            redacted.extend_from_slice(REDACTED);
+            rest = &rest[index + value.len()..];
+        }
+        redacted.extend_from_slice(rest);
+        output = redacted;
+    }
+    output
 }
 
 /// Send one request and read one response over the daemon socket.
@@ -349,9 +392,81 @@ fn render(response: Response) -> ExitCode {
             eprintln!("denied: {reason}");
             ExitCode::FAILURE
         }
+        Response::Timeout { reason } => {
+            eprintln!("timeout: {reason}");
+            ExitCode::FAILURE
+        }
         Response::Error { message } => {
             eprintln!("error: {message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ChunkReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl Read for ChunkReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some(chunk) = self.chunks.pop_front() else {
+                return Ok(0);
+            };
+            buf[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn redacts_complete_secrets_within_a_chunk() {
+        let values = vec![b"top-secret".to_vec()];
+        assert_eq!(
+            redact_chunk(b"before top-secret after", &values),
+            "before ‹redacted› after".as_bytes()
+        );
+    }
+
+    #[test]
+    fn relay_preserves_non_utf8_output() {
+        let input = [0xff, b' ', b's', b'e', b'c', b'r', b'e', b't'];
+        let mut output = Vec::new();
+        relay_redacted(&input[..], &mut output, &[b"secret".to_vec()]).unwrap();
+        assert_eq!(
+            output,
+            [vec![0xff, b' '], "‹redacted›".as_bytes().to_vec()].concat()
+        );
+    }
+
+    #[test]
+    fn relay_flushes_each_chunk_immediately() {
+        let reader = ChunkReader {
+            chunks: [b"first\n".to_vec(), b"second\n".to_vec()].into(),
+        };
+        let mut writer = RecordingWriter::default();
+        relay_redacted(reader, &mut writer, &[]).unwrap();
+        assert_eq!(writer.bytes, b"first\nsecond\n");
+        assert_eq!(writer.flushes, 2);
     }
 }

@@ -24,6 +24,16 @@ credentials from it so the profile's keys never enter your context.
 
 ## How
 
+Always start by running `sx status` to see which sources have live grants, their
+confirmation modes, and the environment variable names they expose. If a
+env file changed, add `--refresh` to the next `sx run` or `sx grant-all` to
+update its cached values without changing a live grant.
+
+Then, decide:
+1. If you are running a single or only a few commands, use `sx run` directly.
+2. If you are running many commands, run `sx grant-all` to avoid prompting the
+user incessantly.
+
 Run the real command through `sx run`, naming a `.env` file with `--env` and/or
 an AWS profile with `--aws-profile`:
 
@@ -61,20 +71,35 @@ sx run --env .env --aws-profile prod -- ./deploy.sh
   `sx run --aws-profile … --`.
 - **Always go through `sx run`.** Don't `export` the values or `source` the
   `.env` — a sandbox may block reading the file directly anyway.
-- If `sx run` prints `denied:`, the user declined the prompt — **stop and ask**,
-  don't retry in a loop.
-- Per-command confirmation is the default. If you are going to do many `sx run`
-  calls and you want to skip the prompts, you can run ofr a single prompt for an hour,
+- If it prints `timeout: user did not approve in time`, the user was likely away;
+  stop and ask them to retry when available. This is not an `sx`/`sxd` failure.
+- If `sx run` otherwise prints `denied:`, the user declined the prompt — **stop
+  and ask**, don't retry in a loop.
+- If you are going to do many `sx run` calls, use `grant-all` first to avoid
+  prompting the user on every `sx` call. Run
   `sx grant-all --env <file>` or `sx grant-all --aws-profile <profile>` once to
-  allow that source for an hour — suggest it, but don't assume it, since it
-  lowers their security. `grant-all` also takes `--lease <duration>` to set the
-  window (e.g. `30m`, `2h`, `1d`; default 1h, max 24h), and can batch repeated
-  sources into one prompt, e.g.
+  allow that source for an hour. `grant-all` also takes `--lease <duration>` to
+  set the window (e.g. `30m`, `2h`, `1d`; default 1h, max 24h), and can batch
+  repeated sources into one prompt, e.g.
   `sx grant-all --aws-profile dev/ro --aws-profile prod/ro --lease 12h`.
 - An allow-all window is reused: running `sx grant-all` again for a source that
   still has a live window just reuses it (no second prompt). Only
-  `sx grant-all --renew …` starts a fresh window early (re-prompts, resets the
-  lease). You won't normally need `--renew`.
+  `sx grant-all --renew …` starts a fresh window early: it re-prompts, reloads
+  env/AWS credentials, and resets the lease.
+- `--refresh` applies only to env files. Use `sx run --env <file> --refresh --
+  <cmd>` or `sx grant-all --env <file> --refresh` to re-read the file without
+  changing a live grant's expiry or confirmation mode. AWS temporary credentials
+  refresh automatically near expiry; use `--renew` when explicitly starting a
+  fresh AWS allow-all lease and re-minting its credentials.
+
+## How does it work?
+
+`sx` is a client for the `sxd` daemon. The daemon reads or mints credentials,
+holds them in memory for the grant's lifetime, and returns them only after the
+applicable approval gates. For `run`, the daemon derives the caller's working
+directory, resolves the requested sources, and returns approved credentials to
+`sx`; `sx` injects them into the command and executes it inside the agent's
+sandbox, redacting secret values from output.
 
 ## Quick reference
 
@@ -84,8 +109,8 @@ sx run --env .env --aws-profile prod -- ./deploy.sh
 | Use several files at once | `sx run --env a.env --env b.env -- <cmd>` |
 | Run a command with an AWS profile | `sx run --aws-profile prod -- <cmd>` |
 | Mix files and profiles | `sx run --env .env --aws-profile prod -- <cmd>` |
+| Refresh a file while running | `sx run --env .env --refresh -- <cmd>` |
+| Refresh an allow-all file | `sx grant-all --env .env --refresh` |
 | See available names (no values) | `sx status` |
 | allow a file without per-command prompts | `sx grant-all --env .env` |
 | allow a profile without per-command prompts | `sx grant-all --aws-profile prod` |
-| revoke a file early | `sx clear .env` |
-| revoke a profile early | `sx clear --aws-profile prod` |

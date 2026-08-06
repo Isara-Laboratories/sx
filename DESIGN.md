@@ -97,9 +97,10 @@ sandbox — see "Trusting `sx`" below.
 - **`sx`** — the in-sandbox client. For `run`, it receives the granted values and
   execs the command itself, redacting the values from the child's output.
   Subcommands: `run` (`--env <path>`, `--aws-profile <name>`, `--grant-all`,
-  `--renew`), `grant-all` (`--lease <duration>`, `--renew`), `clear`
-  (`--aws-profile <name>` or a path), `status`/`list`. `run`/`grant-all` require
-  at least one `--env` or `--aws-profile`; `run --renew` requires `--grant-all`.
+  `--renew`, `--refresh`), `grant-all` (`--lease <duration>`, `--renew`,
+  `--refresh`), `clear` (`--aws-profile <name>` or a path), `status`/`list`.
+  `run` and `grant-all` require at least one `--env` or `--aws-profile`;
+  `--refresh` requires `--env`, and `run --renew` requires `--grant-all`.
 
 ## Trusting `sx`
 
@@ -156,9 +157,17 @@ Re-issuing `grant-all` against a source whose allow-all window is still live is 
 agent (or user) repeating `grant-all` does not generate a fresh TouchID prompt
 each time (in a multi-source batch, the whole batch is skipped when every source
 is already live). To deliberately start a new window before the old one expires —
-re-prompting, re-reading/minting the values, and resetting the lease — pass
-`sx grant-all --renew` (or `sx run --grant-all --renew`). Upgrading a source from
-confirm-mode to allow-all still prompts, since that is a genuine escalation.
+re-prompting, re-reading or re-minting credentials, and resetting the lease —
+pass `sx grant-all --renew` (or `sx run --grant-all --renew`). Upgrading a source
+from confirm-mode to allow-all still prompts, since that is a genuine escalation.
+
+Env-file cache refresh is separate from grant renewal. `sx grant-all --env
+<path> --refresh` and `sx run --env <path> --refresh -- cmd` re-read only the
+named env files without changing a live grant's expiry or confirmation mode. On
+first use there is no old cache or lease to preserve, so the normal fresh grant
+is established. `--refresh` does not apply to AWS profiles; expiring temporary
+AWS credentials refresh automatically during `run`, while `--renew` explicitly
+re-mints them and starts a fresh allow-all lease.
 
 ## How a secret is used
 
@@ -175,8 +184,9 @@ sx run --env .env -- gh pr create --title "..."
    nothing.
 5. `sx` injects the values and execs `gh …` as **its own child**, in `sx`'s cwd,
    inside the sandbox.
-6. `sx` captures the child's stdout/stderr, **redacts** every injected value, and
-   relays them. The agent only ever sees the redacted output.
+6. `sx` reads stdout/stderr concurrently, **redacts** injected values within
+   each chunk, and flushes the sanitized output immediately. This gives agents
+   live progress for long-running commands.
 
 ## Backends
 
@@ -262,8 +272,9 @@ The grant gate is an `ApprovalGate` trait with three implementations:
   sheet via LocalAuthentication (`LAPolicyDeviceOwnerAuthentication` — TouchID,
   Apple Watch, or passcode). A thin Objective-C shim (`src/touchid.m`, built by
   `build.rs`) blocks on a dispatch semaphore until the user responds. A user
-  *cancel* is a denial; it only falls back to the terminal gate when the policy
-  cannot be evaluated at all (no passcode set).
+  *cancel* is a denial; after 60 seconds without a response it returns `timeout:
+  user did not approve in time`. It only falls back to the terminal gate when
+  the policy cannot be evaluated at all (no passcode set).
 - **`CliGate` (`--cli-gate`, default off-macOS).** Yes/no on the daemon's TTY.
 - **`AllowAllGate` (`--no-gate`).** Tests only.
 
@@ -279,11 +290,10 @@ an allow-all grant. Only one human approval prompt can be active at a time.
 - **No per-session grant scoping yet.** Peer auth restricts callers to the
   owning uid, but any process of that uid can use a live grant. Grants should
   additionally be scoped to the session that created them.
-- **Fully-interactive commands aren't supported.** `sx run` inherits stdin (so
-  piped/redirected input works), but buffers stdout/stderr until the child exits
-  so the values can be redacted. A command that must display output *before*
-  reading input (a live TUI/pager, an interactive password prompt) won't show it
-  until exit. Streaming with incremental redaction is a later enhancement.
+- **Redaction is chunk-local.** Output streams live, but a secret split exactly
+  across two OS read chunks may evade replacement. Redaction is an accidental
+  leak guardrail, not a security boundary; the approval gates and sandbox remain
+  the meaningful controls.
 
 ## Roadmap
 
@@ -294,4 +304,4 @@ an allow-all grant. Only one human approval prompt can be active at a time.
 4. Attest `sx`'s identity: audit-token code-sign check + hardened runtime.
 5. Per-session grant scoping.
 6. Keychain backend.
-7. Streaming output with incremental redaction.
+7. ~~Streaming output with chunk-local redaction.~~ **Done.**

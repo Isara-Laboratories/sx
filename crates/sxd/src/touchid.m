@@ -10,6 +10,7 @@
 #import <dispatch/dispatch.h>
 
 // Returns:
+//    2  -> user did not respond within the approval window
 //    1  -> user authenticated
 //    0  -> user cancelled or authentication failed
 //   -1  -> policy cannot be evaluated (e.g. no device passcode set);
@@ -47,7 +48,14 @@ int sx_touchid_authenticate(const char *reason) {
                             dispatch_semaphore_signal(sema);
                           }];
 
-        dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
+        const int64_t approvalTimeoutSeconds = 60;
+        long waitResult = dispatch_semaphore_wait(
+            sema,
+            dispatch_time(DISPATCH_TIME_NOW, approvalTimeoutSeconds * NSEC_PER_SEC));
+        if (waitResult != 0) {
+            [context invalidate];
+            return 2;
+        }
         return approved ? 1 : 0;
     }
 }

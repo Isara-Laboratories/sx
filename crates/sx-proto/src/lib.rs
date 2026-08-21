@@ -23,10 +23,13 @@ pub const SOCKET_ENV: &str = "SX_SOCKET";
 /// a different value, up to [`GRANT_TTL_MAX_SECS`].
 pub const GRANT_TTL_SECS: u64 = 3600;
 
-/// Hard ceiling on a grant lease: 24 hours. `sx grant-all --lease` may request
+/// Hard ceiling on a grant lease: 7 days. `sx grant-all --lease` may request
 /// any duration up to (and including) this; a longer lease is rejected rather
-/// than silently clamped.
-pub const GRANT_TTL_MAX_SECS: u64 = 86_400;
+/// than silently clamped. The week-long ceiling exists for long-running
+/// supervised jobs whose AWS credentials refresh through
+/// [`Request::CredentialProcess`]; the human approves the full window up front
+/// in one TouchID prompt that names the duration.
+pub const GRANT_TTL_MAX_SECS: u64 = 604_800;
 
 /// Parse a human-friendly duration into whole seconds.
 ///
@@ -199,7 +202,30 @@ pub enum Request {
         /// AWS profiles; newly granted files are already read fresh.
         #[serde(default)]
         refresh: bool,
+        /// AWS-session mode: the daemon still gates and mints for the
+        /// `aws_profiles` sources, but strips their secret values from the
+        /// response, keeping only non-secret region hints. The client points
+        /// the child at an AWS config whose `credential_process` redeems
+        /// [`Request::CredentialProcess`], so a long-lived child refreshes
+        /// credentials in place instead of holding a frozen snapshot.
+        #[serde(default)]
+        aws_session: bool,
     },
+
+    /// Return current AWS credentials for a profile that has a live allow-all
+    /// grant, refreshing them when they approach expiry. This powers
+    /// `sx credential-process`, the AWS `credential_process` hook behind
+    /// `sx run --aws-session`: SDKs inside a long-lived child re-invoke it near
+    /// credential expiry, so the child keeps working for as long as the grant
+    /// lease lives without static credentials in its environment.
+    ///
+    /// This request never prompts: SDK refreshes fire at unpredictable times,
+    /// and surprise prompts train users to approve blind. It is denied without
+    /// a live allow-all grant for the profile, and denied unless the verified
+    /// peer is a descendant of a live `--aws-session` run registered for that
+    /// profile — so no process outside a launched session tree can use it to
+    /// print credentials.
+    CredentialProcess { profile: String },
 }
 
 /// A response from the daemon to the client.
@@ -255,8 +281,8 @@ mod tests {
 
     #[test]
     fn parses_at_the_maximum() {
-        assert_eq!(parse_duration("24h").unwrap(), GRANT_TTL_MAX_SECS);
-        assert_eq!(parse_duration("1440m").unwrap(), GRANT_TTL_MAX_SECS);
+        assert_eq!(parse_duration("7d").unwrap(), GRANT_TTL_MAX_SECS);
+        assert_eq!(parse_duration("168h").unwrap(), GRANT_TTL_MAX_SECS);
     }
 
     #[test]
@@ -283,10 +309,10 @@ mod tests {
 
     #[test]
     fn rejects_over_maximum() {
-        let err = parse_duration("2d").unwrap_err();
+        let err = parse_duration("8d").unwrap_err();
         assert!(err.contains("exceeds maximum"), "got: {err}");
-        assert!(parse_duration("25h").is_err());
-        assert!(parse_duration("86401").is_err());
+        assert!(parse_duration("169h").is_err());
+        assert!(parse_duration("604801").is_err());
     }
 
     #[test]

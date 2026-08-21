@@ -55,6 +55,13 @@ sx run --env .env --aws-profile prod -- ./deploy.sh
   `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, usually
   `AWS_CREDENTIAL_EXPIRATION` / `AWS_REGION`). The values come back redacted in
   output, same as `.env` secrets.
+- For a **long-running** command (hours to days), add `--aws-session` (exactly
+  one `--aws-profile`): instead of a static credential snapshot that expires
+  mid-run, the command gets a private AWS config whose `credential_process`
+  redeems fresh credentials from the daemon, so its AWS SDKs refresh in place
+  for as long as the grant lease lives. Keep an allow-all lease alive for the
+  profile (`sx grant-all --aws-profile <p> --lease 7d`) — the refresh path
+  never prompts and is denied without one.
 - The first use of a source (file or profile) prompts the **user** (TouchID) to
   grant it for an hour; by default the user also confirms **each command**.
   These prompts go to the human, not to you.
@@ -69,6 +76,10 @@ sx run --env .env --aws-profile prod -- ./deploy.sh
   — the value returns as `‹redacted›`, so it only wastes a turn. To *use* a
   secret, wrap the real command in `sx run --env … --` or
   `sx run --aws-profile … --`.
+- `sx credential-process` is machine plumbing that AWS SDKs call from inside
+  an `--aws-session` command. Don't invoke it — the daemon refuses callers
+  outside a live `--aws-session` process tree, so running it yourself only
+  prints a denial.
 - **Always go through `sx run`.** Don't `export` the values or `source` the
   `.env` — a sandbox may block reading the file directly anyway.
 - If it prints `timeout: user did not approve in time`, the user was likely away;
@@ -79,7 +90,7 @@ sx run --env .env --aws-profile prod -- ./deploy.sh
   prompting the user on every `sx` call. Run
   `sx grant-all --env <file>` or `sx grant-all --aws-profile <profile>` once to
   allow that source for an hour. `grant-all` also takes `--lease <duration>` to
-  set the window (e.g. `30m`, `2h`, `1d`; default 1h, max 24h), and can batch
+  set the window (e.g. `30m`, `2h`, `7d`; default 1h, max 7d), and can batch
   repeated sources into one prompt, e.g.
   `sx grant-all --aws-profile dev/ro --aws-profile prod/ro --lease 12h`.
 - An allow-all window is reused: running `sx grant-all` again for a source that
@@ -108,6 +119,7 @@ sandbox, redacting secret values from output.
 | Run a command with secrets | `sx run --env .env -- <cmd>` |
 | Use several files at once | `sx run --env a.env --env b.env -- <cmd>` |
 | Run a command with an AWS profile | `sx run --aws-profile prod -- <cmd>` |
+| Long-running command with refreshing AWS creds | `sx run --aws-profile prod --aws-session -- <cmd>` |
 | Mix files and profiles | `sx run --env .env --aws-profile prod -- <cmd>` |
 | Refresh a file while running | `sx run --env .env --refresh -- <cmd>` |
 | Refresh an allow-all file | `sx grant-all --env .env --refresh` |

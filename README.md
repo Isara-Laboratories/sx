@@ -63,7 +63,7 @@ sx grant-all --env .env --renew       # re-prompt, reload values, reset the wind
 sx grant-all --env .env --refresh     # re-read values without changing the window
 sx run --env .env --refresh -- migrate # refresh the file, then stream the command
 
-# Pick a longer (or shorter) window with --lease (default 1h, max 24h):
+# Pick a longer (or shorter) window with --lease (default 1h, max 7d):
 sx grant-all --env .env --lease 1d    # allow-all for a day; also accepts 30m, 2h, 5400
 sx grant-all --aws-profile dev/readonly --aws-profile prod/readonly --lease 12h
                                       # one prompt grants both profiles for 12h
@@ -76,6 +76,14 @@ sx clear .env                         # revoke early
 sx run --aws-profile prod -- aws s3 ls          # 1st use: grant + confirm; SSO/role/static all work
 sx run --env .env --aws-profile prod -- deploy  # merge both sources in one run
 sx clear --aws-profile prod                     # revoke a single profile grant
+
+# Long-lived AWS sessions: a plain run injects a static credential snapshot
+# that expires mid-run for jobs lasting hours or days. --aws-session injects
+# no credentials at all — the child gets a private AWS config whose
+# credential_process redeems fresh credentials from sxd, so its SDKs refresh
+# in place for as long as the (allow-all) grant lease lives.
+sx grant-all --aws-profile prod --lease 7d      # one TouchID approves the whole window
+sx run --aws-profile prod --aws-session -- python long_job.py
 ```
 
 For temporary AWS credentials, `sxd` uses `AWS_CREDENTIAL_EXPIRATION` from the

@@ -57,6 +57,7 @@ struct RunOptions {
     grant_all: bool,
     renew: bool,
     refresh: bool,
+    aws_session: bool,
 }
 
 fn main() -> Result<()> {
@@ -328,6 +329,7 @@ impl Daemon {
                 grant_all,
                 renew,
                 refresh,
+                aws_session,
             } => self.run(
                 env,
                 aws_profiles,
@@ -336,9 +338,11 @@ impl Daemon {
                     grant_all,
                     renew,
                     refresh,
+                    aws_session,
                 },
                 peer,
             ),
+            Request::CredentialProcess { profile } => self.credential_process(&profile),
         }
     }
 
@@ -448,6 +452,7 @@ impl Daemon {
             grant_all,
             renew,
             refresh,
+            aws_session,
         } = options;
         if argv.is_empty() {
             return Response::Error {
@@ -477,10 +482,14 @@ impl Daemon {
         let ttl = Duration::from_secs(GRANT_TTL_SECS);
         let mut merged: Vec<(String, String)> = Vec::new();
         for src in &sources {
-            let values = match self.authorize(src, Some(&argv), grant_all, ttl, renew, refresh) {
+            let mut values = match self.authorize(src, Some(&argv), grant_all, ttl, renew, refresh)
+            {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
+            if aws_session && matches!(src, Source::Aws { .. }) {
+                values.retain(|(k, _)| AWS_SESSION_PASSTHROUGH.contains(&k.as_str()));
+            }
             for (k, v) in values {
                 merged.retain(|(ek, _)| ek != &k);
                 merged.push((k, v));
@@ -488,6 +497,43 @@ impl Daemon {
         }
 
         Response::Granted { secrets: merged }
+    }
+
+    /// Serve one AWS `credential_process` redemption for `sx run --aws-session`
+    /// children: require a live allow-all grant, then return the grant's
+    /// credentials, refreshing them when they expire within
+    /// [`CREDENTIAL_PROCESS_REFRESH_WINDOW_SECS`].
+    ///
+    /// Deliberately never prompts: SDK refreshes fire at unpredictable times,
+    /// and surprise prompts train users to approve blind. A missing or
+    /// confirm-mode grant is a denial naming the command that fixes it.
+    fn credential_process(&self, profile: &str) -> Response {
+        let src = Source::Aws {
+            key: format!("{AWS_SOURCE_PREFIX}{profile}"),
+            profile: profile.to_string(),
+        };
+        let live = self.state.lock().unwrap().live(src.key());
+        let Some(live) = live else {
+            return Response::Denied {
+                reason: format!(
+                    "no live grant for {}; run `sx grant-all --aws-profile {profile} --lease <duration>` first",
+                    src.key()
+                ),
+            };
+        };
+        if !live.allow_all {
+            return Response::Denied {
+                reason: format!(
+                    "grant for {} is confirm-mode; credential_process refreshes need an allow-all lease \
+                     (`sx grant-all --aws-profile {profile}`)",
+                    src.key()
+                ),
+            };
+        }
+        match self.refresh_aws_within(&src, live.values, CREDENTIAL_PROCESS_REFRESH_WINDOW_SECS) {
+            Ok(secrets) => Response::Granted { secrets },
+            Err(resp) => resp,
+        }
     }
 
     /// The two gates for one already-resolved source.
@@ -729,10 +775,21 @@ impl Daemon {
         src: &Source,
         values: Vec<(String, String)>,
     ) -> Result<Vec<(String, String)>, Response> {
+        self.refresh_aws_within(src, values, AWS_REFRESH_WINDOW_SECS)
+    }
+
+    /// Refresh temporary AWS credentials that expire within `window_secs`.
+    /// This changes only the cached values; it never extends the human grant.
+    fn refresh_aws_within(
+        &self,
+        src: &Source,
+        values: Vec<(String, String)>,
+        window_secs: i64,
+    ) -> Result<Vec<(String, String)>, Response> {
         let Source::Aws { profile, .. } = src else {
             return Ok(values);
         };
-        if !aws_credentials_need_refresh(&values, OffsetDateTime::now_utc())? {
+        if !aws_credentials_need_refresh(&values, OffsetDateTime::now_utc(), window_secs)? {
             return Ok(values);
         }
 
@@ -757,17 +814,18 @@ impl Daemon {
             .ok_or_else(|| Response::Denied {
                 reason: format!("grant for {source} expired before credential refresh"),
             })?;
-        if !aws_credentials_need_refresh(&current.values, OffsetDateTime::now_utc())? {
+        if !aws_credentials_need_refresh(&current.values, OffsetDateTime::now_utc(), window_secs)? {
             return Ok(current.values);
         }
 
         let refreshed = (self.aws_minter)(profile)?;
         let refreshed_values = sorted_values(&refreshed);
-        if aws_credentials_need_refresh(&refreshed_values, OffsetDateTime::now_utc())? {
+        if aws_credentials_need_refresh(&refreshed_values, OffsetDateTime::now_utc(), window_secs)?
+        {
             return Err(Response::Error {
                 message: format!(
                     "AWS CLI returned credentials for profile {profile} that expire within {} minutes",
-                    AWS_REFRESH_WINDOW_SECS / 60
+                    window_secs / 60
                 ),
             });
         }
@@ -787,6 +845,17 @@ const AWS_SOURCE_PREFIX: &str = "aws:";
 const AWS_CREDENTIAL_EXPIRATION: &str = "AWS_CREDENTIAL_EXPIRATION";
 const AWS_REFRESH_WINDOW_SECS: i64 = 5 * 60;
 
+/// Freshness window for [`Request::CredentialProcess`] responses. Wider than
+/// [`AWS_REFRESH_WINDOW_SECS`] because botocore mandates a refresh when
+/// credentials expire within 10 minutes: returned credentials must always sit
+/// outside that threshold or SDK refresh loops would never converge.
+const CREDENTIAL_PROCESS_REFRESH_WINDOW_SECS: i64 = 10 * 60;
+
+/// The only minted AWS variables an `--aws-session` run response may carry:
+/// non-secret region hints. Everything else stays in the daemon and is served
+/// through [`Request::CredentialProcess`] refreshes.
+const AWS_SESSION_PASSTHROUGH: [&str; 2] = ["AWS_DEFAULT_REGION", "AWS_REGION"];
+
 fn sorted_values(values: &HashMap<String, String>) -> Vec<(String, String)> {
     let mut values: Vec<(String, String)> = values
         .iter()
@@ -801,6 +870,7 @@ fn sorted_values(values: &HashMap<String, String>) -> Vec<(String, String)> {
 fn aws_credentials_need_refresh(
     values: &[(String, String)],
     now: OffsetDateTime,
+    window_secs: i64,
 ) -> Result<bool, Response> {
     let Some((_, expiration)) = values
         .iter()
@@ -811,7 +881,7 @@ fn aws_credentials_need_refresh(
     let expiration = OffsetDateTime::parse(expiration, &Rfc3339).map_err(|e| Response::Error {
         message: format!("AWS CLI returned an invalid {AWS_CREDENTIAL_EXPIRATION}: {e}"),
     })?;
-    Ok(expiration <= now + time::Duration::seconds(AWS_REFRESH_WINDOW_SECS))
+    Ok(expiration <= now + time::Duration::seconds(window_secs))
 }
 
 /// A resolved secret source: a canonical `.env` file path, or a named AWS
@@ -1152,15 +1222,23 @@ mod tests {
             "temporary",
         ));
 
-        assert!(!aws_credentials_need_refresh(&static_values, now).unwrap());
-        assert!(!aws_credentials_need_refresh(&outside_window, now).unwrap());
-        assert!(aws_credentials_need_refresh(&at_window, now).unwrap());
+        assert!(
+            !aws_credentials_need_refresh(&static_values, now, AWS_REFRESH_WINDOW_SECS).unwrap()
+        );
+        assert!(
+            !aws_credentials_need_refresh(&outside_window, now, AWS_REFRESH_WINDOW_SECS).unwrap()
+        );
+        assert!(aws_credentials_need_refresh(&at_window, now, AWS_REFRESH_WINDOW_SECS).unwrap());
     }
 
     #[test]
     fn invalid_aws_expiration_is_an_error() {
         let values = sorted_values(&aws_test_values(Some("not-a-time"), "temporary"));
-        let result = aws_credentials_need_refresh(&values, OffsetDateTime::now_utc());
+        let result = aws_credentials_need_refresh(
+            &values,
+            OffsetDateTime::now_utc(),
+            AWS_REFRESH_WINDOW_SECS,
+        );
         assert!(matches!(result, Err(Response::Error { .. })));
     }
 
@@ -1246,6 +1324,182 @@ mod tests {
 
     fn allow_all_daemon() -> Daemon {
         Daemon::new(Box::new(AllowAllGate))
+    }
+
+    #[test]
+    fn credential_process_denied_without_live_grant() {
+        let daemon = allow_all_daemon();
+        let response = daemon.dispatch(
+            Request::CredentialProcess {
+                profile: "prod".to_string(),
+            },
+            &self_peer(),
+        );
+        match response {
+            Response::Denied { reason } => {
+                assert!(
+                    reason.contains("no live grant for aws:prod"),
+                    "got: {reason}"
+                );
+                assert!(
+                    reason.contains("sx grant-all --aws-profile prod"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn credential_process_denied_for_confirm_mode_grant() {
+        let daemon = allow_all_daemon();
+        daemon.state.lock().unwrap().add(
+            format!("{AWS_SOURCE_PREFIX}prod"),
+            aws_test_values(Some("2099-01-01T00:00:00Z"), "cached"),
+            Duration::from_secs(GRANT_TTL_SECS),
+            false,
+        );
+        let response = daemon.dispatch(
+            Request::CredentialProcess {
+                profile: "prod".to_string(),
+            },
+            &self_peer(),
+        );
+        match response {
+            Response::Denied { reason } => {
+                assert!(reason.contains("confirm-mode"), "got: {reason}");
+                assert!(reason.contains("allow-all lease"), "got: {reason}");
+            }
+            other => panic!("expected denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn credential_process_reuses_fresh_values_and_refreshes_expiring_ones() {
+        let fresh = aws_test_values(Some("2099-01-01T00:00:00Z"), "minted");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_minter = Arc::clone(&calls);
+        let minter: Arc<AwsMinter> = Arc::new(move |_profile| {
+            calls_for_minter.fetch_add(1, Ordering::SeqCst);
+            Ok(fresh.clone())
+        });
+        let daemon = Daemon::with_aws_minter(Box::new(AllowAllGate), minter);
+        daemon.state.lock().unwrap().add(
+            format!("{AWS_SOURCE_PREFIX}prod"),
+            aws_test_values(Some("2099-01-01T00:00:00Z"), "cached"),
+            Duration::from_secs(GRANT_TTL_SECS),
+            true,
+        );
+
+        let cached = daemon.dispatch(
+            Request::CredentialProcess {
+                profile: "prod".to_string(),
+            },
+            &self_peer(),
+        );
+        match cached {
+            Response::Granted { secrets } => {
+                assert!(secrets
+                    .iter()
+                    .any(|(name, value)| name == "AWS_ACCESS_KEY_ID" && value == "cached"));
+            }
+            other => panic!("expected grant, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // Credentials inside the 10-minute credential_process window re-mint,
+        // even though they sit outside the narrower 5-minute run window.
+        daemon.state.lock().unwrap().replace_values(
+            &format!("{AWS_SOURCE_PREFIX}prod"),
+            aws_test_values(
+                Some(
+                    &(OffsetDateTime::now_utc() + time::Duration::minutes(8))
+                        .format(&Rfc3339)
+                        .unwrap(),
+                ),
+                "expiring",
+            ),
+        );
+        let refreshed = daemon.dispatch(
+            Request::CredentialProcess {
+                profile: "prod".to_string(),
+            },
+            &self_peer(),
+        );
+        match refreshed {
+            Response::Granted { secrets } => {
+                assert!(secrets
+                    .iter()
+                    .any(|(name, value)| name == "AWS_ACCESS_KEY_ID" && value == "minted"));
+            }
+            other => panic!("expected grant, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn aws_session_run_strips_secret_values_but_keeps_region_hints() {
+        let daemon = allow_all_daemon();
+        let mut values = aws_test_values(Some("2099-01-01T00:00:00Z"), "AKIA123");
+        values.insert("AWS_REGION".to_string(), "us-west-2".to_string());
+        daemon.state.lock().unwrap().add(
+            format!("{AWS_SOURCE_PREFIX}prod"),
+            values,
+            Duration::from_secs(GRANT_TTL_SECS),
+            true,
+        );
+        let response = daemon.dispatch(
+            Request::Run {
+                env: vec![],
+                aws_profiles: vec!["prod".to_string()],
+                argv: vec!["true".to_string()],
+                grant_all: false,
+                renew: false,
+                refresh: false,
+                aws_session: true,
+            },
+            &self_peer(),
+        );
+        match response {
+            Response::Granted { secrets } => {
+                assert_eq!(
+                    secrets,
+                    vec![("AWS_REGION".to_string(), "us-west-2".to_string())]
+                );
+            }
+            other => panic!("expected grant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_run_still_returns_full_aws_values() {
+        let daemon = allow_all_daemon();
+        daemon.state.lock().unwrap().add(
+            format!("{AWS_SOURCE_PREFIX}prod"),
+            aws_test_values(Some("2099-01-01T00:00:00Z"), "AKIA123"),
+            Duration::from_secs(GRANT_TTL_SECS),
+            true,
+        );
+        let response = daemon.dispatch(
+            Request::Run {
+                env: vec![],
+                aws_profiles: vec!["prod".to_string()],
+                argv: vec!["true".to_string()],
+                grant_all: false,
+                renew: false,
+                refresh: false,
+                aws_session: false,
+            },
+            &self_peer(),
+        );
+        match response {
+            Response::Granted { secrets } => {
+                let names: Vec<&str> = secrets.iter().map(|(name, _)| name.as_str()).collect();
+                assert!(names.contains(&"AWS_ACCESS_KEY_ID"));
+                assert!(names.contains(&"AWS_SECRET_ACCESS_KEY"));
+            }
+            other => panic!("expected grant, got {other:?}"),
+        }
     }
 
     struct RecordingGate {
@@ -1380,6 +1634,7 @@ mod tests {
                 grant_all: false,
                 renew: false,
                 refresh: false,
+                aws_session: false,
             },
         );
         let run_response = read_response(&mut run_client);
@@ -1687,6 +1942,7 @@ mod tests {
                 grant_all: false,
                 renew: false,
                 refresh: false,
+                aws_session: false,
             },
             &self_peer(),
         );
@@ -1703,6 +1959,7 @@ mod tests {
                 grant_all: false,
                 renew: false,
                 refresh: true,
+                aws_session: false,
             },
             &self_peer(),
         );
@@ -1771,6 +2028,7 @@ mod tests {
                 grant_all: false,
                 renew: false,
                 refresh: true,
+                aws_session: false,
             },
             &self_peer(),
         );
@@ -1790,6 +2048,7 @@ mod tests {
                 grant_all: false,
                 renew: false,
                 refresh: true,
+                aws_session: false,
             },
             &self_peer(),
         );

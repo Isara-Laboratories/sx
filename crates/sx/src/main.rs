@@ -12,7 +12,9 @@
 mod skill;
 
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -58,7 +60,7 @@ enum Cmd {
     /// prompts. Runs nothing — use this to opt a file out of confirmation.
     ///
     /// The grant lasts one hour by default; pass --lease <DURATION> to choose a
-    /// different window, up to a maximum of 24 hours (1d). A duration is an
+    /// different window, up to a maximum of 7 days (7d). A duration is an
     /// integer with an optional unit suffix s/m/h/d (no suffix = seconds), e.g.
     /// 30m, 2h, 1d, or 5400.
     ///
@@ -74,8 +76,8 @@ enum Cmd {
         /// AWS profile to allow-all (repeatable).
         #[arg(long = "aws-profile")]
         aws_profile: Vec<String>,
-        /// How long the grant lasts: 30m, 2h, 1d, or plain seconds (default 1h,
-        /// max 24h).
+        /// How long the grant lasts: 30m, 2h, 7d, or plain seconds (default 1h,
+        /// max 7d).
         #[arg(long = "lease", value_parser = parse_duration)]
         lease: Option<u64>,
         /// Start a fresh allow-all window even if one is still live: re-prompt,
@@ -114,9 +116,28 @@ enum Cmd {
         /// Re-read env files without changing a live grant's expiry or mode.
         #[arg(long, requires = "env")]
         refresh: bool,
+        /// Long-lived AWS session mode: inject no static AWS credentials.
+        /// The command instead reads a private AWS config whose
+        /// `credential_process` redeems fresh credentials from the daemon, so
+        /// its SDKs refresh in place for as long as the grant lease lives
+        /// (keep an allow-all lease alive, e.g. `sx grant-all --aws-profile
+        /// <p> --lease 7d`). Requires exactly one --aws-profile.
+        #[arg(long = "aws-session")]
+        aws_session: bool,
         /// The command and its arguments, after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
+    },
+    /// Print AWS credentials for a profile in the AWS `credential_process`
+    /// JSON format. Machine plumbing behind `sx run --aws-session`: AWS SDKs
+    /// inside the launched command invoke this near credential expiry. It
+    /// requires a live allow-all grant for the profile and never prompts.
+    /// The output feeds SDKs directly and is not redacted; do not invoke it
+    /// to inspect credentials.
+    CredentialProcess {
+        /// AWS profile to mint fresh credentials from.
+        #[arg(long = "aws-profile")]
+        aws_profile: String,
     },
 }
 
@@ -175,13 +196,28 @@ fn run() -> Result<ExitCode> {
             grant_all,
             renew,
             refresh,
+            aws_session,
             argv,
         } => {
             if env.is_empty() && aws_profile.is_empty() {
                 anyhow::bail!("run requires at least one --env <path> or --aws-profile <profile>");
             }
-            exec_with_secrets(env, aws_profile, argv, grant_all, renew, refresh)
+            if aws_session && aws_profile.len() != 1 {
+                anyhow::bail!("--aws-session requires exactly one --aws-profile");
+            }
+            exec_with_secrets(
+                env,
+                aws_profile,
+                argv,
+                RunFlags {
+                    grant_all,
+                    renew,
+                    refresh,
+                    aws_session,
+                },
+            )
         }
+        Cmd::CredentialProcess { aws_profile } => credential_process(aws_profile),
         Cmd::GrantAll {
             env,
             aws_profile,
@@ -232,21 +268,28 @@ fn run_skill(action: SkillAction) -> Result<ExitCode> {
 /// Ask the daemon (gated) for the secrets from `env` files and `aws_profiles`,
 /// then inject and exec `argv` as our own child, redacting the secret values
 /// from its output.
+/// The run-mode flags forwarded from the CLI into one daemon `Run` request.
+struct RunFlags {
+    grant_all: bool,
+    renew: bool,
+    refresh: bool,
+    aws_session: bool,
+}
+
 fn exec_with_secrets(
     env: Vec<String>,
     aws_profiles: Vec<String>,
     argv: Vec<String>,
-    grant_all: bool,
-    renew: bool,
-    refresh: bool,
+    flags: RunFlags,
 ) -> Result<ExitCode> {
     let response = send(&Request::Run {
         env,
-        aws_profiles,
+        aws_profiles: aws_profiles.clone(),
         argv: argv.clone(),
-        grant_all,
-        renew,
-        refresh,
+        grant_all: flags.grant_all,
+        renew: flags.renew,
+        refresh: flags.refresh,
+        aws_session: flags.aws_session,
     })?;
 
     let granted = match response {
@@ -258,6 +301,18 @@ fn exec_with_secrets(
     cmd.args(&argv[1..]);
     for (name, value) in &granted {
         cmd.env(name, value);
+    }
+    if flags.aws_session {
+        // An older daemon ignores `aws_session` and returns the static
+        // credentials; refuse rather than silently launching a child whose
+        // credentials would freeze at exec.
+        if granted
+            .iter()
+            .any(|(name, _)| name == "AWS_SECRET_ACCESS_KEY")
+        {
+            anyhow::bail!("sxd predates --aws-session; rebuild and restart the daemon");
+        }
+        configure_aws_session(&mut cmd, &aws_profiles[0], &granted)?;
     }
     // Inherit stdin so commands that read input (pipes, prompts) work. Drain
     // stdout and stderr concurrently, redacting and flushing each chunk as it
@@ -295,6 +350,125 @@ fn exec_with_secrets(
     Ok(ExitCode::from(
         u8::try_from(status.code().unwrap_or(1)).unwrap_or(1),
     ))
+}
+
+/// Point a child at a private AWS config whose `credential_process` redeems
+/// fresh credentials from the daemon, instead of injecting a frozen snapshot.
+///
+/// Ambient static AWS credentials are removed from the child environment
+/// because SDK provider chains prefer them over the config file; region hints
+/// returned by the daemon are injected normally by the caller.
+fn configure_aws_session(
+    cmd: &mut Command,
+    profile: &str,
+    granted: &[(String, String)],
+) -> Result<()> {
+    let exe = std::env::current_exe().context("resolving the sx binary path")?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("$HOME is not set")?;
+    let region = granted
+        .iter()
+        .find(|(name, _)| name == "AWS_REGION" || name == "AWS_DEFAULT_REGION")
+        .map(|(_, value)| value.as_str());
+
+    let config_path = aws_session_config_path(&home, profile);
+    let config_dir = config_path
+        .parent()
+        .context("AWS session config path has no parent directory")?;
+    std::fs::create_dir_all(config_dir)
+        .with_context(|| format!("creating {}", config_dir.display()))?;
+    std::fs::write(&config_path, aws_session_config(&exe, profile, region))
+        .with_context(|| format!("writing {}", config_path.display()))?;
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restricting {}", config_path.display()))?;
+
+    cmd.env("AWS_CONFIG_FILE", &config_path);
+    for name in [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_CREDENTIAL_EXPIRATION",
+        "AWS_PROFILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+    ] {
+        cmd.env_remove(name);
+    }
+    Ok(())
+}
+
+/// Render the private AWS config for an `--aws-session` child: one default
+/// profile whose `credential_process` calls back into this same binary. The
+/// config file itself contains no secrets.
+fn aws_session_config(exe: &Path, profile: &str, region: Option<&str>) -> String {
+    let mut config = format!(
+        "[default]\ncredential_process = \"{}\" credential-process --aws-profile \"{}\"\n",
+        exe.display(),
+        profile
+    );
+    if let Some(region) = region {
+        config.push_str(&format!("region = {region}\n"));
+    }
+    config
+}
+
+/// Deterministic per-profile config path under `~/.sx/aws-session/`, so
+/// repeated runs reuse one file and the child can outlive this process.
+fn aws_session_config_path(home: &Path, profile: &str) -> PathBuf {
+    let sanitized: String = profile
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    home.join(".sx")
+        .join("aws-session")
+        .join(format!("{sanitized}.config"))
+}
+
+/// Redeem one AWS `credential_process` refresh from the daemon and print it
+/// in the AWS credential_process JSON contract. Machine-facing plumbing: the
+/// output feeds an SDK, so it is intentionally not redacted.
+fn credential_process(profile: String) -> Result<ExitCode> {
+    let response = send(&Request::CredentialProcess { profile })?;
+    let granted = match response {
+        Response::Granted { secrets } => secrets,
+        other => return Ok(render(other)),
+    };
+    println!("{}", credential_process_json(&granted)?);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Render granted AWS values as credential_process JSON: Version 1 plus
+/// AccessKeyId/SecretAccessKey and optional SessionToken/Expiration. The
+/// daemon's `AWS_CREDENTIAL_EXPIRATION` passes through verbatim so the SDK
+/// schedules its own refresh.
+fn credential_process_json(secrets: &[(String, String)]) -> Result<String> {
+    let get = |name: &str| {
+        secrets
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    let access = get("AWS_ACCESS_KEY_ID").context("daemon returned no AWS_ACCESS_KEY_ID")?;
+    let secret =
+        get("AWS_SECRET_ACCESS_KEY").context("daemon returned no AWS_SECRET_ACCESS_KEY")?;
+    let mut json = serde_json::json!({
+        "Version": 1,
+        "AccessKeyId": access,
+        "SecretAccessKey": secret,
+    });
+    if let Some(token) = get("AWS_SESSION_TOKEN") {
+        json["SessionToken"] = token.into();
+    }
+    if let Some(expiration) = get("AWS_CREDENTIAL_EXPIRATION") {
+        json["Expiration"] = expiration.into();
+    }
+    Ok(json.to_string())
 }
 
 /// Relay one output stream live, redacting each read chunk independently.
@@ -468,5 +642,66 @@ mod tests {
         relay_redacted(reader, &mut writer, &[]).unwrap();
         assert_eq!(writer.bytes, b"first\nsecond\n");
         assert_eq!(writer.flushes, 2);
+    }
+
+    #[test]
+    fn credential_process_json_carries_the_full_contract() {
+        let grant = vec![
+            ("AWS_ACCESS_KEY_ID".to_string(), "AKIA123".to_string()),
+            (
+                "AWS_CREDENTIAL_EXPIRATION".to_string(),
+                "2026-01-01T00:00:00Z".to_string(),
+            ),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "sekrit".to_string()),
+            ("AWS_SESSION_TOKEN".to_string(), "tok==".to_string()),
+        ];
+        let json: serde_json::Value =
+            serde_json::from_str(&credential_process_json(&grant).unwrap()).unwrap();
+        assert_eq!(json["Version"], 1);
+        assert_eq!(json["AccessKeyId"], "AKIA123");
+        assert_eq!(json["SecretAccessKey"], "sekrit");
+        assert_eq!(json["SessionToken"], "tok==");
+        assert_eq!(json["Expiration"], "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn credential_process_json_omits_absent_optionals_and_requires_keys() {
+        let minimal = vec![
+            ("AWS_ACCESS_KEY_ID".to_string(), "AKIA123".to_string()),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "sekrit".to_string()),
+        ];
+        let json: serde_json::Value =
+            serde_json::from_str(&credential_process_json(&minimal).unwrap()).unwrap();
+        assert!(json.get("SessionToken").is_none());
+        assert!(json.get("Expiration").is_none());
+
+        let missing = vec![("AWS_ACCESS_KEY_ID".to_string(), "AKIA123".to_string())];
+        assert!(credential_process_json(&missing).is_err());
+    }
+
+    #[test]
+    fn aws_session_config_points_credential_process_at_this_binary() {
+        let config = aws_session_config(
+            Path::new("/Users/u/.cargo/bin/sx"),
+            "asi-dev/admin",
+            Some("us-west-2"),
+        );
+        assert_eq!(
+            config,
+            "[default]\n\
+             credential_process = \"/Users/u/.cargo/bin/sx\" credential-process --aws-profile \"asi-dev/admin\"\n\
+             region = us-west-2\n"
+        );
+        let without_region = aws_session_config(Path::new("/bin/sx"), "prod", None);
+        assert!(!without_region.contains("region"));
+    }
+
+    #[test]
+    fn aws_session_config_path_sanitizes_profile_names() {
+        let path = aws_session_config_path(Path::new("/Users/u"), "asi-dev/admin");
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/u/.sx/aws-session/asi-dev-admin.config")
+        );
     }
 }

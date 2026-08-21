@@ -130,10 +130,12 @@ enum Cmd {
     },
     /// Print AWS credentials for a profile in the AWS `credential_process`
     /// JSON format. Machine plumbing behind `sx run --aws-session`: AWS SDKs
-    /// inside the launched command invoke this near credential expiry. It
-    /// requires a live allow-all grant for the profile and never prompts.
-    /// The output feeds SDKs directly and is not redacted; do not invoke it
-    /// to inspect credentials.
+    /// inside the launched command invoke this near credential expiry. The
+    /// daemon serves it only to descendants of a live `--aws-session` run
+    /// with a live allow-all grant, and never prompts — invoked anywhere
+    /// else it prints a denial, not credentials. Hidden from help because it
+    /// is not an operator command.
+    #[command(hide = true)]
     CredentialProcess {
         /// AWS profile to mint fresh credentials from.
         #[arg(long = "aws-profile")]

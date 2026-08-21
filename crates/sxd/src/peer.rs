@@ -142,6 +142,67 @@ fn pid_cwd(pid: i32) -> io::Result<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd"))
 }
 
+/// macOS: parent pid via `proc_pidinfo(PROC_PIDTBSDINFO)`.
+#[cfg(target_os = "macos")]
+fn pid_parent(pid: i32) -> io::Result<i32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // Safety: info is a correctly-sized, zeroed target buffer.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if n < size {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.pbi_ppid as i32)
+}
+
+/// Linux: parent pid from `/proc/<pid>/stat`; the ppid is the second field
+/// after the last `)`, which safely skips a comm containing parentheses.
+#[cfg(target_os = "linux")]
+fn pid_parent(pid: i32) -> io::Result<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let malformed = || io::Error::new(io::ErrorKind::InvalidData, "malformed /proc/<pid>/stat");
+    let (_, after_comm) = stat.rsplit_once(')').ok_or_else(malformed)?;
+    let ppid = after_comm.split_whitespace().nth(1).ok_or_else(malformed)?;
+    ppid.parse().map_err(|_| malformed())
+}
+
+/// The pid followed by its ancestors, nearest first, ending at init/launchd.
+/// Bounded so a pathological ppid cycle cannot loop forever; a lookup failure
+/// simply truncates the chain (treated as "not a descendant" by callers).
+pub fn ancestor_pids(pid: i32) -> Vec<i32> {
+    let mut chain = vec![pid];
+    let mut current = pid;
+    for _ in 0..128 {
+        match pid_parent(current) {
+            Ok(parent) if parent > 0 && parent != current => {
+                chain.push(parent);
+                current = parent;
+            }
+            _ => break,
+        }
+    }
+    chain
+}
+
+/// Whether `pid` is a live process. `EPERM` proves existence: the signal was
+/// blocked by permissions, not by the pid being free.
+pub fn pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // Safety: kill with signal 0 performs only validity/permission checks.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn pid_cwd(_pid: i32) -> io::Result<PathBuf> {
     Err(io::Error::new(
@@ -163,5 +224,28 @@ mod tests {
 
         assert_eq!(peer.uid, own_uid());
         assert_eq!(peer.pid, std::process::id() as i32);
+    }
+
+    #[test]
+    fn ancestor_chain_of_a_child_contains_this_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let child_pid = child.id() as i32;
+
+        let chain = ancestor_pids(child_pid);
+
+        assert_eq!(chain[0], child_pid);
+        assert!(chain.contains(&(std::process::id() as i32)));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn pid_liveness_tracks_real_processes() {
+        assert!(pid_alive(std::process::id() as i32));
+        assert!(!pid_alive(0));
+        assert!(!pid_alive(-1));
     }
 }

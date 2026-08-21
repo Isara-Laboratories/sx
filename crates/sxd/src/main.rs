@@ -49,9 +49,22 @@ struct Daemon {
     /// concurrent commands share one AWS CLI invocation.
     aws_refresh_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     aws_minter: Arc<AwsMinter>,
+    /// Live `--aws-session` runs, keyed by the requesting `sx run` client pid.
+    /// [`Request::CredentialProcess`] is served only to descendants of one of
+    /// these roots, so nothing outside a launched session tree — in
+    /// particular an agent shell — can redeem credentials directly. Dead
+    /// roots are purged on every touch.
+    aws_sessions: Mutex<Vec<AwsSession>>,
 }
 
 type AwsMinter = dyn Fn(&str) -> Result<HashMap<String, String>, Response> + Send + Sync;
+
+/// One live `--aws-session` run: which profile it may redeem and the `sx run`
+/// process that owns the launched child tree.
+struct AwsSession {
+    profile: String,
+    root_pid: i32,
+}
 
 struct RunOptions {
     grant_all: bool,
@@ -240,6 +253,7 @@ impl Daemon {
             gate: Mutex::new(gate),
             aws_refresh_locks: Mutex::new(HashMap::new()),
             aws_minter,
+            aws_sessions: Mutex::new(Vec::new()),
         }
     }
 
@@ -342,7 +356,7 @@ impl Daemon {
                 },
                 peer,
             ),
-            Request::CredentialProcess { profile } => self.credential_process(&profile),
+            Request::CredentialProcess { profile } => self.credential_process(&profile, peer),
         }
     }
 
@@ -496,7 +510,50 @@ impl Daemon {
             }
         }
 
+        if aws_session {
+            for src in &sources {
+                if let Source::Aws { profile, .. } = src {
+                    self.register_aws_session(profile, peer.pid);
+                }
+            }
+        }
+
         Response::Granted { secrets: merged }
+    }
+
+    /// Record one authorized `--aws-session` run so later
+    /// [`Request::CredentialProcess`] redemptions can be tree-bound to it.
+    fn register_aws_session(&self, profile: &str, root_pid: i32) {
+        let mut sessions = self.aws_sessions.lock().unwrap();
+        sessions.retain(|session| peer::pid_alive(session.root_pid));
+        let exists = sessions
+            .iter()
+            .any(|session| session.profile == profile && session.root_pid == root_pid);
+        if !exists {
+            sessions.push(AwsSession {
+                profile: profile.to_string(),
+                root_pid,
+            });
+        }
+    }
+
+    /// Whether `peer` runs inside the process tree of a live `--aws-session`
+    /// run registered for `profile`.
+    fn peer_in_aws_session(&self, profile: &str, peer: &Peer) -> bool {
+        let roots: Vec<i32> = {
+            let mut sessions = self.aws_sessions.lock().unwrap();
+            sessions.retain(|session| peer::pid_alive(session.root_pid));
+            sessions
+                .iter()
+                .filter(|session| session.profile == profile)
+                .map(|session| session.root_pid)
+                .collect()
+        };
+        if roots.is_empty() {
+            return false;
+        }
+        let ancestry = peer::ancestor_pids(peer.pid);
+        roots.iter().any(|root| ancestry.contains(root))
     }
 
     /// Serve one AWS `credential_process` redemption for `sx run --aws-session`
@@ -507,7 +564,21 @@ impl Daemon {
     /// Deliberately never prompts: SDK refreshes fire at unpredictable times,
     /// and surprise prompts train users to approve blind. A missing or
     /// confirm-mode grant is a denial naming the command that fixes it.
-    fn credential_process(&self, profile: &str) -> Response {
+    ///
+    /// Redemptions are additionally tree-bound: the requesting process must be
+    /// a descendant of a live `sx run --aws-session` root for this profile.
+    /// Anything else — including an agent invoking `sx credential-process`
+    /// from its own shell — is denied, so this command can never print
+    /// credentials outside a launched session tree.
+    fn credential_process(&self, profile: &str, peer: &Peer) -> Response {
+        if !self.peer_in_aws_session(profile, peer) {
+            return Response::Denied {
+                reason: format!(
+                    "credential_process redemptions for profile {profile} are only served inside \
+                     a live `sx run --aws-session` process tree"
+                ),
+            };
+        }
         let src = Source::Aws {
             key: format!("{AWS_SOURCE_PREFIX}{profile}"),
             profile: profile.to_string(),
@@ -1326,9 +1397,135 @@ mod tests {
         Daemon::new(Box::new(AllowAllGate))
     }
 
+    /// Register a live `--aws-session` rooted at this test process so
+    /// credential_process requests from `self_peer()` pass the tree gate.
+    fn register_self_session(daemon: &Daemon, profile: &str) {
+        daemon.register_aws_session(profile, std::process::id() as i32);
+    }
+
+    #[test]
+    fn credential_process_denied_outside_any_session_tree() {
+        // Even a live allow-all grant is not enough: a caller outside every
+        // registered --aws-session tree (e.g. an agent shell) is refused
+        // before any credential state is consulted.
+        let daemon = allow_all_daemon();
+        daemon.state.lock().unwrap().add(
+            format!("{AWS_SOURCE_PREFIX}prod"),
+            aws_test_values(Some("2099-01-01T00:00:00Z"), "cached"),
+            Duration::from_secs(GRANT_TTL_SECS),
+            true,
+        );
+        let response = daemon.dispatch(
+            Request::CredentialProcess {
+                profile: "prod".to_string(),
+            },
+            &self_peer(),
+        );
+        match response {
+            Response::Denied { reason } => {
+                assert!(
+                    reason
+                        .contains("only served inside a live `sx run --aws-session` process tree"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn credential_process_denied_for_live_root_outside_ancestry() {
+        // A live session for the profile exists, but this caller is not a
+        // descendant of its root, so redemption is still refused.
+        let daemon = allow_all_daemon();
+        daemon.state.lock().unwrap().add(
+            format!("{AWS_SOURCE_PREFIX}prod"),
+            aws_test_values(Some("2099-01-01T00:00:00Z"), "cached"),
+            Duration::from_secs(GRANT_TTL_SECS),
+            true,
+        );
+        let mut sibling = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        daemon.register_aws_session("prod", sibling.id() as i32);
+        let response = daemon.dispatch(
+            Request::CredentialProcess {
+                profile: "prod".to_string(),
+            },
+            &self_peer(),
+        );
+        sibling.kill().unwrap();
+        sibling.wait().unwrap();
+        assert!(matches!(response, Response::Denied { .. }));
+    }
+
+    #[test]
+    fn credential_process_denied_after_session_root_exits() {
+        let daemon = allow_all_daemon();
+        daemon.state.lock().unwrap().add(
+            format!("{AWS_SOURCE_PREFIX}prod"),
+            aws_test_values(Some("2099-01-01T00:00:00Z"), "cached"),
+            Duration::from_secs(GRANT_TTL_SECS),
+            true,
+        );
+        let mut root = std::process::Command::new("true").spawn().unwrap();
+        let root_pid = root.id() as i32;
+        root.wait().unwrap();
+        daemon.register_aws_session("prod", root_pid);
+        let response = daemon.dispatch(
+            Request::CredentialProcess {
+                profile: "prod".to_string(),
+            },
+            &self_peer(),
+        );
+        assert!(matches!(response, Response::Denied { .. }));
+    }
+
+    #[test]
+    fn aws_session_run_registers_a_redeemable_session() {
+        // One dispatch cycle end to end: an --aws-session run registers this
+        // peer's tree, after which credential_process redeems from it.
+        let daemon = allow_all_daemon();
+        daemon.state.lock().unwrap().add(
+            format!("{AWS_SOURCE_PREFIX}prod"),
+            aws_test_values(Some("2099-01-01T00:00:00Z"), "cached"),
+            Duration::from_secs(GRANT_TTL_SECS),
+            true,
+        );
+        let run = daemon.dispatch(
+            Request::Run {
+                env: vec![],
+                aws_profiles: vec!["prod".to_string()],
+                argv: vec!["true".to_string()],
+                grant_all: false,
+                renew: false,
+                refresh: false,
+                aws_session: true,
+            },
+            &self_peer(),
+        );
+        assert!(matches!(run, Response::Granted { .. }));
+        let redeemed = daemon.dispatch(
+            Request::CredentialProcess {
+                profile: "prod".to_string(),
+            },
+            &self_peer(),
+        );
+        match redeemed {
+            Response::Granted { secrets } => {
+                assert!(secrets
+                    .iter()
+                    .any(|(name, value)| name == "AWS_ACCESS_KEY_ID" && value == "cached"));
+            }
+            other => panic!("expected grant, got {other:?}"),
+        }
+    }
+
     #[test]
     fn credential_process_denied_without_live_grant() {
         let daemon = allow_all_daemon();
+        register_self_session(&daemon, "prod");
         let response = daemon.dispatch(
             Request::CredentialProcess {
                 profile: "prod".to_string(),
@@ -1353,6 +1550,7 @@ mod tests {
     #[test]
     fn credential_process_denied_for_confirm_mode_grant() {
         let daemon = allow_all_daemon();
+        register_self_session(&daemon, "prod");
         daemon.state.lock().unwrap().add(
             format!("{AWS_SOURCE_PREFIX}prod"),
             aws_test_values(Some("2099-01-01T00:00:00Z"), "cached"),
@@ -1384,6 +1582,7 @@ mod tests {
             Ok(fresh.clone())
         });
         let daemon = Daemon::with_aws_minter(Box::new(AllowAllGate), minter);
+        register_self_session(&daemon, "prod");
         daemon.state.lock().unwrap().add(
             format!("{AWS_SOURCE_PREFIX}prod"),
             aws_test_values(Some("2099-01-01T00:00:00Z"), "cached"),

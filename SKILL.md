@@ -76,9 +76,10 @@ sx run --env .env --aws-profile prod -- ./deploy.sh
   — the value returns as `‹redacted›`, so it only wastes a turn. To *use* a
   secret, wrap the real command in `sx run --env … --` or
   `sx run --aws-profile … --`.
-- **Never invoke `sx credential-process` yourself.** It is unredacted machine
-  plumbing that AWS SDKs call from inside an `--aws-session` command; running
-  it directly prints live credentials into your context.
+- `sx credential-process` is machine plumbing that AWS SDKs call from inside
+  an `--aws-session` command. Don't invoke it — the daemon refuses callers
+  outside a live `--aws-session` process tree, so running it yourself only
+  prints a denial.
 - **Always go through `sx run`.** Don't `export` the values or `source` the
   `.env` — a sandbox may block reading the file directly anyway.
 - If it prints `timeout: user did not approve in time`, the user was likely away;

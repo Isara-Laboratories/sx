@@ -81,7 +81,10 @@ sx clear --aws-profile prod                     # revoke a single profile grant
 # that expires mid-run for jobs lasting hours or days. --aws-session injects
 # no credentials at all — the child gets a private AWS config whose
 # credential_process redeems fresh credentials from sxd, so its SDKs refresh
-# in place for as long as the (allow-all) grant lease lives.
+# in place for as long as the (allow-all) grant lease lives. Redemptions are
+# tree-bound: sxd walks the caller's process ancestry and serves only
+# descendants of a live --aws-session run, so nothing outside the launched
+# tree (in particular an agent shell) can print credentials through it.
 sx grant-all --aws-profile prod --lease 7d      # one TouchID approves the whole window
 sx run --aws-profile prod --aws-session -- python long_job.py
 ```

@@ -220,8 +220,11 @@ pub enum Request {
     /// lease lives without static credentials in its environment.
     ///
     /// This request never prompts: SDK refreshes fire at unpredictable times,
-    /// and surprise prompts train users to approve blind. Without a live
-    /// allow-all grant for the profile it is denied.
+    /// and surprise prompts train users to approve blind. It is denied without
+    /// a live allow-all grant for the profile, and denied unless the verified
+    /// peer is a descendant of a live `--aws-session` run registered for that
+    /// profile — so no process outside a launched session tree can use it to
+    /// print credentials.
     CredentialProcess { profile: String },
 }
 

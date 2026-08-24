@@ -301,9 +301,7 @@ fn exec_with_secrets(
 
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
-    for (name, value) in &granted {
-        cmd.env(name, value);
-    }
+    configure_child_environment(&mut cmd, &granted, !aws_profiles.is_empty());
     if flags.aws_session {
         // An older daemon ignores `aws_session` and returns the static
         // credentials; refuse rather than silently launching a child whose
@@ -352,6 +350,21 @@ fn exec_with_secrets(
     Ok(ExitCode::from(
         u8::try_from(status.code().unwrap_or(1)).unwrap_or(1),
     ))
+}
+
+/// Inject granted values into a child while preventing an ambient or
+/// file-sourced profile from overriding credentials minted by `--aws-profile`.
+fn configure_child_environment(
+    cmd: &mut Command,
+    granted: &[(String, String)],
+    aws_profile_requested: bool,
+) {
+    for (name, value) in granted {
+        cmd.env(name, value);
+    }
+    if aws_profile_requested {
+        cmd.env_remove("AWS_PROFILE");
+    }
 }
 
 /// Point a child at a private AWS config whose `credential_process` redeems
@@ -582,6 +595,7 @@ fn render(response: Response) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     struct ChunkReader {
         chunks: std::collections::VecDeque<Vec<u8>>,
@@ -679,6 +693,24 @@ mod tests {
 
         let missing = vec![("AWS_ACCESS_KEY_ID".to_string(), "AKIA123".to_string())];
         assert!(credential_process_json(&missing).is_err());
+    }
+
+    #[test]
+    fn aws_profile_source_removes_aws_profile_from_child_environment() {
+        let granted = vec![
+            ("AWS_PROFILE".to_string(), "from-env-file".to_string()),
+            ("OTHER".to_string(), "preserved".to_string()),
+        ];
+        let mut cmd = Command::new("true");
+
+        configure_child_environment(&mut cmd, &granted, true);
+
+        let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(env.get(OsStr::new("AWS_PROFILE")), Some(&None));
+        assert_eq!(
+            env.get(OsStr::new("OTHER")).and_then(|value| *value),
+            Some(OsStr::new("preserved"))
+        );
     }
 
     #[test]

@@ -49,6 +49,7 @@ struct Daemon {
     /// concurrent commands share one AWS CLI invocation.
     aws_refresh_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     aws_minter: Arc<AwsMinter>,
+    aws_profile_lister: Arc<AwsProfileLister>,
     /// Live `--aws-session` runs, keyed by the requesting `sx run` client pid.
     /// [`Request::CredentialProcess`] is served only to descendants of one of
     /// these roots, so nothing outside a launched session tree — in
@@ -58,6 +59,7 @@ struct Daemon {
 }
 
 type AwsMinter = dyn Fn(&str) -> Result<HashMap<String, String>, Response> + Send + Sync;
+type AwsProfileLister = dyn Fn() -> Result<Vec<String>, Response> + Send + Sync;
 
 /// One live `--aws-session` run: which profile it may redeem and the `sx run`
 /// process that owns the launched child tree.
@@ -244,15 +246,24 @@ fn default_gate() -> Box<dyn ApprovalGate> {
 
 impl Daemon {
     fn new(gate: Box<dyn ApprovalGate>) -> Self {
-        Self::with_aws_minter(gate, Arc::new(mint_aws))
+        Self::with_aws_services(gate, Arc::new(mint_aws), Arc::new(list_aws_profiles))
     }
 
     fn with_aws_minter(gate: Box<dyn ApprovalGate>, aws_minter: Arc<AwsMinter>) -> Self {
+        Self::with_aws_services(gate, aws_minter, Arc::new(list_aws_profiles))
+    }
+
+    fn with_aws_services(
+        gate: Box<dyn ApprovalGate>,
+        aws_minter: Arc<AwsMinter>,
+        aws_profile_lister: Arc<AwsProfileLister>,
+    ) -> Self {
         Self {
             state: Mutex::new(State::default()),
             gate: Mutex::new(gate),
             aws_refresh_locks: Mutex::new(HashMap::new()),
             aws_minter,
+            aws_profile_lister,
             aws_sessions: Mutex::new(Vec::new()),
         }
     }
@@ -328,6 +339,10 @@ impl Daemon {
             Request::Clear { path } => self.clear(path, peer),
             Request::Status => Response::Status {
                 captures: self.state.lock().unwrap().info(),
+            },
+            Request::Inventory => match (self.aws_profile_lister)() {
+                Ok(aws_profiles) => Response::Inventory { aws_profiles },
+                Err(response) => response,
             },
             Request::GrantAll {
                 env,
@@ -1153,6 +1168,47 @@ fn resolve_aws_cli() -> Result<PathBuf, Response> {
     Ok(configured)
 }
 
+/// List configured AWS profile names by asking the AWS CLI outside the agent
+/// sandbox. This reads configuration metadata only; it does not resolve or
+/// export credentials and therefore does not require an approval prompt.
+fn list_aws_profiles() -> Result<Vec<String>, Response> {
+    let aws = resolve_aws_cli()?;
+    let output = Command::new(&aws)
+        .args(["configure", "list-profiles"])
+        .output()
+        .map_err(|e| Response::Error {
+            message: format!(
+                "cannot run `{}` to list AWS profiles: {e} (re-run `sxd setup` — the AWS CLI may have moved)",
+                aws.display()
+            ),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Response::Error {
+            message: format!("aws could not list profiles: {}", stderr.trim()),
+        });
+    }
+
+    let stdout = String::from_utf8(output.stdout).map_err(|e| Response::Error {
+        message: format!("aws returned non-UTF-8 profile names: {e}"),
+    })?;
+    Ok(parse_aws_profile_list(&stdout))
+}
+
+/// Parse `aws configure list-profiles` output into a stable, unique list.
+fn parse_aws_profile_list(text: &str) -> Vec<String> {
+    let mut profiles: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+        .map(str::to_string)
+        .collect();
+    profiles.sort();
+    profiles.dedup();
+    profiles
+}
+
 /// Mint temporary AWS credentials for `profile` by shelling out to the AWS CLI.
 ///
 /// Runs `aws configure export-credentials --profile <profile> --format
@@ -1254,6 +1310,14 @@ mod tests {
         assert_eq!(map["AWS_SESSION_TOKEN"], "tok==");
         assert_eq!(map["AWS_CREDENTIAL_EXPIRATION"], "2026-01-01T00:00:00Z");
         assert_eq!(map.len(), 4);
+    }
+
+    #[test]
+    fn parses_aws_profile_list_as_sorted_unique_names() {
+        assert_eq!(
+            parse_aws_profile_list("prod\n default \ndev\nprod\n\n"),
+            vec!["default", "dev", "prod"]
+        );
     }
 
     #[test]
@@ -1764,6 +1828,36 @@ mod tests {
         Peer {
             uid: 0,
             pid: std::process::id() as i32,
+        }
+    }
+
+    #[test]
+    fn inventory_lists_profiles_without_approval() {
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let lister_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&lister_calls);
+        let minter: Arc<AwsMinter> = Arc::new(|_| panic!("inventory must not mint credentials"));
+        let lister: Arc<AwsProfileLister> = Arc::new(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec!["default".to_string(), "prod/readonly".to_string()])
+        });
+        let daemon = Daemon::with_aws_services(
+            Box::new(RecordingGate {
+                prompts: Arc::clone(&prompts),
+            }),
+            minter,
+            lister,
+        );
+
+        let response = daemon.dispatch(Request::Inventory, &self_peer());
+
+        assert_eq!(lister_calls.load(Ordering::SeqCst), 1);
+        assert!(prompts.lock().unwrap().is_empty());
+        match response {
+            Response::Inventory { aws_profiles } => {
+                assert_eq!(aws_profiles, vec!["default", "prod/readonly"]);
+            }
+            other => panic!("expected inventory, got {other:?}"),
         }
     }
 

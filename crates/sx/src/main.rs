@@ -49,6 +49,8 @@ enum Cmd {
     },
     /// Show active grants and the secret names they expose (never values).
     Status,
+    /// List configured AWS profile names (never credentials; no approval).
+    Inventory,
     /// Alias for `status`, framed as "what secrets can I use right now".
     List,
     /// Install or remove the sx usage skill for AI coding agents.
@@ -247,6 +249,7 @@ fn run() -> Result<ExitCode> {
             Ok(render(send(&Request::Clear { path })?))
         }
         Cmd::Status | Cmd::List => Ok(render(send(&Request::Status)?)),
+        Cmd::Inventory => Ok(render(send(&Request::Inventory)?)),
         Cmd::Skill { action } => run_skill(action),
     }
 }
@@ -568,6 +571,17 @@ fn render(response: Response) -> ExitCode {
                     for n in c.names {
                         println!("  {n}");
                     }
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Response::Inventory { aws_profiles } => {
+            println!("AWS profiles:");
+            if aws_profiles.is_empty() {
+                println!("  (none configured)");
+            } else {
+                for profile in aws_profiles {
+                    println!("  {profile}");
                 }
             }
             ExitCode::SUCCESS

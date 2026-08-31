@@ -127,6 +127,10 @@ pub enum Request {
     /// Report active grants and the secret names they expose (never values).
     Status,
 
+    /// List configured AWS profile names. This metadata contains no credential
+    /// values and is returned without an approval prompt.
+    Inventory,
+
     /// Pre-authorize one or more secret sources in *allow-all* mode: grant the
     /// source for an hour AND suppress the per-command prompt for that window.
     /// Runs no command — `sx grant-all --env <path> --aws-profile <name>`.
@@ -237,6 +241,9 @@ pub enum Response {
 
     /// Current daemon state.
     Status { captures: Vec<CaptureInfo> },
+
+    /// Configured AWS profile names, safe to show without approval.
+    Inventory { aws_profiles: Vec<String> },
 
     /// The per-use gate approved: here are the requested secret values for the
     /// client to inject into the child it is about to exec. This is the only

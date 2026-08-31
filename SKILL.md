@@ -25,9 +25,11 @@ credentials from it so the profile's keys never enter your context.
 ## How
 
 Always start by running `sx status` to see which sources have live grants, their
-confirmation modes, and the environment variable names they expose. If a
-env file changed, add `--refresh` to the next `sx run` or `sx grant-all` to
-update its cached values without changing a live grant.
+confirmation modes, and the environment variable names they expose. Run `sx
+inventory` when you need to discover which AWS profile names are available; it
+returns names only and never requires approval. If an env file changed, add
+`--refresh` to the next `sx run` or `sx grant-all` to update its cached values
+without changing a live grant.
 
 Then, decide:
 1. If you are running a single or only a few commands, use `sx run` directly.
@@ -65,8 +67,9 @@ sx run --env .env --aws-profile prod -- ./deploy.sh
 - The first use of a source (file or profile) prompts the **user** (TouchID) to
   grant it for an hour; by default the user also confirms **each command**.
   These prompts go to the human, not to you.
-- See what's available without seeing values: `sx status` (lists files and
-  variable names only).
+- See what's available without seeing values: `sx status` lists active grants
+  and variable names; `sx inventory` lists all configured AWS profile names.
+  Neither command shows credential values, and inventory requires no approval.
 
 ## Rules — important
 
@@ -123,6 +126,7 @@ sandbox, redacting secret values from output.
 | Mix files and profiles | `sx run --env .env --aws-profile prod -- <cmd>` |
 | Refresh a file while running | `sx run --env .env --refresh -- <cmd>` |
 | Refresh an allow-all file | `sx grant-all --env .env --refresh` |
-| See available names (no values) | `sx status` |
+| See active grants and variable names | `sx status` |
+| Discover configured AWS profile names | `sx inventory` |
 | allow a file without per-command prompts | `sx grant-all --env .env` |
 | allow a profile without per-command prompts | `sx grant-all --aws-profile prod` |

@@ -98,8 +98,9 @@ sandbox — see "Trusting `sx`" below.
   execs the command itself, redacting the values from the child's output.
   Subcommands: `run` (`--env <path>`, `--aws-profile <name>`, `--grant-all`,
   `--renew`, `--refresh`), `grant-all` (`--lease <duration>`, `--renew`,
-  `--refresh`), `clear` (`--aws-profile <name>` or a path), `status`/`list`.
-  `run` and `grant-all` require at least one `--env` or `--aws-profile`;
+  `--refresh`), `clear` (`--aws-profile <name>` or a path), `inventory`
+  (approval-free AWS profile names), `status`/`list`. `run` and `grant-all`
+  require at least one `--env` or `--aws-profile`;
   `--refresh` requires `--env`, and `run --renew` requires `--grant-all`.
 
 ## Trusting `sx`
@@ -217,6 +218,11 @@ subject shown at the human prompt.
   as a denial/error. It never folds that output into a successful grant. A
   single `sx run --env .env --aws-profile prod -- cmd` runs every gate and
   merges both sources' values.
+
+  **Profile discovery is approval-free.** `sx inventory` asks the daemon to run
+  `aws configure list-profiles` and returns only sorted, deduplicated profile
+  names. It does not resolve or export credentials. This gives sandboxed agents
+  the profile metadata they need without granting access to `~/.aws`.
 
   **The `aws` CLI path is resolved once at setup, not searched at runtime.**
   launchd starts `sxd` as a LaunchAgent with a minimal `$PATH`

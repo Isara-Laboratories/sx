@@ -69,6 +69,7 @@ sx grant-all --aws-profile dev/readonly --aws-profile prod/readonly --lease 12h
                                       # one prompt grants both profiles for 12h
 
 sx status                             # granted files + mode + names (never values)
+sx inventory                          # all configured AWS profile names; no approval prompt
 sx clear .env                         # revoke early
 
 # AWS profiles are a second source. The grant controls access to the profile.
@@ -87,6 +88,18 @@ sx clear --aws-profile prod                     # revoke a single profile grant
 # tree (in particular an agent shell) can print credentials through it.
 sx grant-all --aws-profile prod --lease 7d      # one TouchID approves the whole window
 sx run --aws-profile prod --aws-session -- python long_job.py
+```
+
+`sx inventory` asks the out-of-sandbox daemon to run `aws configure
+list-profiles`. It returns only profile names, sorted and deduplicated. It does
+not read or mint credentials, so it never requests approval. This lets an agent
+choose a profile even when its sandbox cannot access `~/.aws`. Output is a
+labeled, indented list:
+
+```text
+AWS profiles:
+  default
+  prod/readonly
 ```
 
 For temporary AWS credentials, `sxd` uses `AWS_CREDENTIAL_EXPIRATION` from the
